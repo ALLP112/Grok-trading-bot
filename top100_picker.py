@@ -1,6 +1,6 @@
 """
-UPGRADED TOP100 PICKER BOT — Deep First-Principles + FIXED Execution
-Robust price fetching + error handling
+UPGRADED TOP100 PICKER BOT — Deep First-Principles + STRICT SINGLE POSITION
+Always closes any existing position before opening a new one
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== UPGRADED TOP100 PICKER BOT STARTING (FIXED) ===", flush=True)
+print("=== UPGRADED TOP100 PICKER BOT STARTING (STRICT SINGLE POSITION) ===", flush=True)
 print("Grok 4.1 Thinking + Two-Stage Deep First-Principles mode active", flush=True)
 
 load_dotenv()
@@ -45,16 +45,29 @@ exchange = ccxt.binance({
 exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO futures", flush=True)
 
+async def close_all_positions():
+    """Closes ALL open positions before opening a new one"""
+    try:
+        positions = exchange.fetch_positions()
+        for pos in positions:
+            if float(pos['contracts']) != 0:
+                symbol = pos['symbol']
+                side = 'sell' if float(pos['contracts']) > 0 else 'buy'
+                amount = abs(float(pos['contracts']))
+                exchange.create_market_order(symbol, side, amount)
+                print(f"   🔄 Closed existing position: {symbol}", flush=True)
+    except Exception as e:
+        print(f"   ⚠️ Error closing positions: {e}", flush=True)
+
 async def get_top_candidates(n=25):
     markets = exchange.load_markets()
     tickers = exchange.fetch_tickers()
     candidates = []
-    
     for symbol, ticker in tickers.items():
         market = markets.get(symbol, {})
-        if (symbol.endswith('USDT') and 
-            market.get('swap', False) and 
-            market.get('contractType') == 'PERPETUAL' and 
+        if (symbol.endswith('USDT') and
+            market.get('swap', False) and
+            market.get('contractType') == 'PERPETUAL' and
             market.get('active', False)):
             
             try:
@@ -64,7 +77,7 @@ async def get_top_candidates(n=25):
                 funding = 0.0
                 
             vol = ticker.get('quoteVolume') or 0
-            
+           
             candidates.append({
                 'symbol': symbol,
                 'price': ticker['last'],
@@ -72,35 +85,28 @@ async def get_top_candidates(n=25):
                 'volume': vol,
                 'funding': funding
             })
-    
+   
     candidates.sort(key=lambda x: x['volume'], reverse=True)
     return candidates[:n]
 
 async def grok_decision(candidates):
     data_str = "\n".join([
-        f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B" 
+        f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B"
         for c in candidates
     ])
-
     prompt = f"""You are AlphaEdge Pro, a first-principles crypto perpetuals trader.
-
 Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
 Timeframe: next {INTERVAL_MINUTES} minutes
-
 Top 25 candidates by volume:
 {data_str}
-
 Stage 1: Quick filter — identify the 6–8 most promising coins based on order flow imbalance, liquidity, positioning, and asymmetry.
-
 Stage 2: Deep first-principles analysis on those 6–8 coins only. For each, explain:
 - Net aggressive order flow
 - Liquidity consumption vs provision
 - Forced flows / positioning pressure
 - Information asymmetry & narrative
 - Psychological feedback loops
-
 Then pick the **single best** long or short setup (or hold if no real edge).
-
 Return ONLY valid JSON:
 {{
   "symbol": "e.g. SOLUSDT",
@@ -113,16 +119,14 @@ Return ONLY valid JSON:
   "reason": "concise 1-2 sentence first-principles explanation of why this is the best edge",
   "key_risks": ["bullet 1", "bullet 2"]
 }}
-
 Only trade if confidence >= 0.76 and R:R >= 2.2:1."""
-
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
         max_tokens=1200
     )
-    
+   
     try:
         text = response.choices[0].message.content.strip()
         if "```json" in text:
@@ -133,37 +137,40 @@ Only trade if confidence >= 0.76 and R:R >= 2.2:1."""
 
 async def execute(decision):
     if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
-        print(f"   ⏸️ HOLD — best candidate was {decision.get('symbol', 'none')} (confidence {decision.get('confidence', 0):.2f})", flush=True)
+        print(f" ⏸️ HOLD — best candidate was {decision.get('symbol', 'none')} (confidence {decision.get('confidence', 0):.2f})", flush=True)
         return
 
     symbol = decision.get("symbol")
     if not symbol:
-        print("   ❌ No symbol in decision", flush=True)
+        print(" ❌ No symbol in decision", flush=True)
         return
 
     try:
-        # Fetch fresh live price for accuracy
+        # === STRICT SINGLE POSITION RULE ===
+        await close_all_positions()
+
+        # Fetch fresh live price
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
-        
+       
         exchange.set_leverage(decision["leverage"], symbol)
         side = "buy" if decision["action"] == "long" else "sell"
-        amount = decision["size_usdt"] / current_price   # use fresh price
+        amount = decision["size_usdt"] / current_price
         exchange.create_market_order(symbol, side, amount)
-        
-        print(f"   ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
-        print(f"   💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
+       
+        print(f" ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
+        print(f" 💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
     except Exception as e:
-        print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
+        print(f" ❌ Execution error on {symbol}: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Fixed Execution) is now RUNNING on DEMO", flush=True)
+    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Strict Single Position) is now RUNNING on DEMO", flush=True)
     while True:
         try:
             candidates = await get_top_candidates(25)
             print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] Scanning top 25 → deep analysis...", flush=True)
             decision = await grok_decision(candidates)
-            print(f"   🤖 Grok picks: {decision.get('symbol')} {decision.get('action')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
+            print(f" 🤖 Grok picks: {decision.get('symbol')} {decision.get('action')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
             await execute(decision)
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
