@@ -1,5 +1,5 @@
 """
-FINAL GROK TRADING BOT — 100% Grok 4.1 Thinking (profit-optimized)
+FINAL GROK TRADING BOT — 100% Grok 4.1 Thinking (first-principles + profit-optimized)
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -13,7 +13,7 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== GROK TRADING BOT STARTING (FINAL Binance v1) ===", flush=True)
-print("Grok 4.1 Thinking + AlphaEdge Pro profit-optimized prompt active", flush=True)
+print("Grok 4.1 Thinking + First-Principles AlphaEdge Pro prompt active", flush=True)
 
 load_dotenv()
 
@@ -27,12 +27,9 @@ MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "1.0"))
 
 # === CHECK REQUIRED KEYS ===
 missing = []
-if not XAI_API_KEY:
-    missing.append("XAI_API_KEY")
-if not BINANCE_API_KEY:
-    missing.append("BINANCE_API_KEY")
-if not BINANCE_API_SECRET:
-    missing.append("BINANCE_API_SECRET")
+if not XAI_API_KEY: missing.append("XAI_API_KEY")
+if not BINANCE_API_KEY: missing.append("BINANCE_API_KEY")
+if not BINANCE_API_SECRET: missing.append("BINANCE_API_SECRET")
 if missing:
     print(f"❌ FATAL: Missing environment variables: {', '.join(missing)}", flush=True)
     print("Set them in Render Dashboard → Environment tab", flush=True)
@@ -60,9 +57,15 @@ async def get_live_data():
     }
 
 async def grok_decision(data):
-    prompt = f"""You are **AlphaEdge Pro**, a battle-tested elite crypto perpetuals trader who has generated consistent profits in live high-stakes environments (including top-performing runs in Alpha Arena crypto perps with real capital).
+    prompt = f"""You are **AlphaEdge Pro**, a first-principles crypto perpetuals trader who thinks like a physicist of markets.
 
-You only take trades with **clear statistical edge**, positive expected value after fees/slippage, and favorable risk-reward (minimum 2:1). You never force trades in chop or low-conviction setups. Your priority is long-term compounding with strict drawdown protection.
+Price moves **only** because of imbalance between aggressive buying and selling pressure. This imbalance arises from:
+- Net order flow (who is hitting bids/offers harder)
+- Liquidity consumption vs provision (where stops cluster, where resting liquidity sits)
+- Positioning & forced flows (funding payments, liquidations, deleveraging)
+- Information asymmetry (whales, smart money, on-chain signals, narrative consensus)
+- Psychological feedback loops (FOMO, capitulation, herd behaviour)
+- Macro capital allocation (risk-on/risk-off, correlation flows)
 
 Current snapshot:
 - Time (UTC): {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
@@ -72,15 +75,7 @@ Current snapshot:
 - Balance: ${data['balance']:,.2f} USDT
 - Timeframe: next {INTERVAL_MINUTES} minutes
 
-Perform rigorous multi-angle analysis:
-1. Technical structure (multi-timeframe, order blocks, liquidity pools, momentum, volume profile)
-2. Funding rate regime and implied bias
-3. Real-time X sentiment & narrative (Grok native firehose advantage — whale/smart money positioning)
-4. On-chain flows and exchange inflows/outflows
-5. Macro regime and correlations
-6. Liquidity, open interest, and liquidation heat
-
-Calculate expected edge. Only trade if you have high conviction and asymmetry.
+Reason step-by-step from first principles above. Then calculate true statistical edge after slippage and funding.
 
 Return **ONLY** valid JSON, nothing else:
 
@@ -91,17 +86,17 @@ Return **ONLY** valid JSON, nothing else:
   "stop_loss": number,
   "take_profit": number or null,
   "confidence": float 0.00-1.00,
-  "reason": "concise 1-2 sentence synthesis of the edge",
+  "reason": "concise 1-2 sentence synthesis of the first-principles edge",
   "key_risks": ["bullet point 1", "bullet point 2"]
 }}
 
-Strict rule: Only take long or short if confidence >= 0.74 **AND** risk-reward is at least 2:1. Otherwise always "hold". Never over-leverage or chase."""
+Strict rule: Only take long or short if confidence >= 0.76 **AND** expected risk-reward >= 2.2:1. Otherwise always "hold". Never chase or over-leverage."""
 
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
-        max_tokens=800
+        max_tokens=900
     )
     
     try:
@@ -114,7 +109,7 @@ Strict rule: Only take long or short if confidence >= 0.74 **AND** risk-reward i
 
 async def execute(decision, data):
     if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
-        print(f"   ⏸️  HOLD — confidence {decision.get('confidence', 0):.2f} | Reason: {decision.get('reason', 'n/a')}", flush=True)
+        print(f"   ⏸️ HOLD — confidence {decision.get('confidence', 0):.2f} | Reason: {decision.get('reason', 'n/a')}", flush=True)
         return
     try:
         exchange.set_leverage(decision["leverage"], SYMBOL)
@@ -127,9 +122,9 @@ async def execute(decision, data):
         print(f"   ❌ Execution error: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Grok Binance Auto-Trader (Grok 4.1 Thinking + AlphaEdge Pro) is now RUNNING on DEMO", flush=True)
+    print("🚀 Grok Binance Auto-Trader (Grok 4.1 Thinking + First-Principles AlphaEdge Pro) is now RUNNING on DEMO", flush=True)
     print(f"📊 Trading {SYMBOL} every {INTERVAL_MINUTES} minutes", flush=True)
-    print(f"⚙️  Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
+    print(f"⚙️ Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
     print("=" * 60, flush=True)
     while True:
         try:
