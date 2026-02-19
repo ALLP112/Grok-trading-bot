@@ -1,6 +1,6 @@
 """
-UPGRADED TOP100 PICKER BOT — Deep First-Principles + Fixed Filtering
-Robust handling of valid perpetual futures only
+UPGRADED TOP100 PICKER BOT — Deep First-Principles + FIXED Execution
+Robust price fetching + error handling
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -52,7 +52,6 @@ async def get_top_candidates(n=25):
     
     for symbol, ticker in tickers.items():
         market = markets.get(symbol, {})
-        # Strict filter: only active perpetual USDT futures
         if (symbol.endswith('USDT') and 
             market.get('swap', False) and 
             market.get('contractType') == 'PERPETUAL' and 
@@ -136,18 +135,29 @@ async def execute(decision):
     if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
         print(f"   ⏸️ HOLD — best candidate was {decision.get('symbol', 'none')} (confidence {decision.get('confidence', 0):.2f})", flush=True)
         return
+
+    symbol = decision.get("symbol")
+    if not symbol:
+        print("   ❌ No symbol in decision", flush=True)
+        return
+
     try:
-        exchange.set_leverage(decision["leverage"], decision["symbol"])
+        # Fetch fresh live price for accuracy
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        
+        exchange.set_leverage(decision["leverage"], symbol)
         side = "buy" if decision["action"] == "long" else "sell"
-        amount = decision["size_usdt"] / decision["price"]
-        exchange.create_market_order(decision["symbol"], side, amount)
-        print(f"   ✅ EXECUTED {decision['action'].upper()} {decision['symbol']} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x", flush=True)
+        amount = decision["size_usdt"] / current_price   # use fresh price
+        exchange.create_market_order(symbol, side, amount)
+        
+        print(f"   ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
         print(f"   💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
     except Exception as e:
-        print(f"   ❌ Execution error: {e}", flush=True)
+        print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage First-Principles + Fixed Filtering) is now RUNNING on DEMO", flush=True)
+    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Fixed Execution) is now RUNNING on DEMO", flush=True)
     while True:
         try:
             candidates = await get_top_candidates(25)
