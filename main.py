@@ -1,6 +1,6 @@
 """
 FINAL GROK TRADING BOT — 100% Grok 4.20 (SuperGrok Heavy style ready)
-Binance Testnet — runs 24/7 on Render.com
+Binance Demo Trading — runs 24/7 on Render.com
 """
 
 import os
@@ -44,9 +44,11 @@ exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'},
+    'options': {
+        'defaultType': 'future',
+        'demoTrading': True,
+    },
 })
-exchange.set_sandbox_mode(True)  # Binance Testnet
 
 async def get_live_data():
     ticker = exchange.fetch_ticker(SYMBOL)
@@ -109,7 +111,7 @@ async def execute(decision, data):
         print(f"Execution error: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Grok Binance Auto-Trader (Grok 4.20 Heavy style) is now RUNNING on TESTNET", flush=True)
+    print("🚀 Grok Binance Auto-Trader (Grok 4.20 Heavy style) is now RUNNING on DEMO", flush=True)
     print(f"📊 Trading {SYMBOL} every {INTERVAL_MINUTES} minutes", flush=True)
     print(f"⚙️  Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
     while True:
