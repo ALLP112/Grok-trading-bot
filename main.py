@@ -44,11 +44,10 @@ exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'future',
-        'demoTrading': True,
-    },
+    'options': {'defaultType': 'future'},
 })
+exchange.enable_demo_trading(True)
+print("✅ Connected to Binance DEMO futures (demo-fapi.binance.com)", flush=True)
 
 async def get_live_data():
     ticker = exchange.fetch_ticker(SYMBOL)
@@ -99,27 +98,29 @@ Only trade if confidence > 0.65."""
 
 async def execute(decision, data):
     if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
-        print("No confident trade — holding", flush=True)
+        print(f"   ⏸️  HOLD — confidence {decision.get('confidence', 0):.2f} | Reason: {decision.get('reason', 'n/a')}", flush=True)
         return
     try:
         exchange.set_leverage(decision["leverage"], SYMBOL)
         side = "buy" if decision["action"] == "long" else "sell"
         amount = decision["size_usdt"] / data["price"]
         exchange.create_market_order(SYMBOL, side, amount)
-        print(f"✅ EXECUTED {decision['action'].upper()} | Size ${decision['size_usdt']:.0f}", flush=True)
+        print(f"   ✅ EXECUTED {decision['action'].upper()} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x", flush=True)
+        print(f"   💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
     except Exception as e:
-        print(f"Execution error: {e}", flush=True)
+        print(f"   ❌ Execution error: {e}", flush=True)
 
 async def main_loop():
     print("🚀 Grok Binance Auto-Trader (Grok 4.20 Heavy style) is now RUNNING on DEMO", flush=True)
     print(f"📊 Trading {SYMBOL} every {INTERVAL_MINUTES} minutes", flush=True)
     print(f"⚙️  Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
+    print("=" * 60, flush=True)
     while True:
         try:
             data = await get_live_data()
-            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Checking {SYMBOL} — Price ${data['price']:,.2f}", flush=True)
+            print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] {SYMBOL} — ${data['price']:,.2f} | Balance: ${data['balance']:,.2f} USDT", flush=True)
             decision = await grok_decision(data)
-            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Grok says: {decision.get('action', 'unknown')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
+            print(f"   🤖 Grok says: {decision.get('action', 'unknown')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
             await execute(decision, data)
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
