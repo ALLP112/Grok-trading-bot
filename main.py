@@ -1,6 +1,6 @@
 """
 FINAL GROK TRADING BOT — 100% Grok 4.20 (SuperGrok Heavy style)
-Binance Testnet only — runs 24/7 on Render.com
+Binance Testnet — runs 24/7 on Render.com
 """
 
 import os
@@ -12,6 +12,7 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== GROK TRADING BOT STARTING (FINAL Binance v1) ===")
+print("Grok 4.20 + SuperGrok Heavy style prompt active")
 
 load_dotenv()
 
@@ -64,7 +65,7 @@ Return ONLY valid JSON:
 }}
 
 Only trade if confidence > 0.65."""
-    
+
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
