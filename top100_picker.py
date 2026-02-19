@@ -1,6 +1,6 @@
 """
-UPGRADED TOP100 PICKER BOT — Deep First-Principles + STRICT SINGLE POSITION
-Always closes any existing position before opening a new one
+UPGRADED TOP100 PICKER BOT — Strict Single Position + Robust Margin Handling
+Closes any open position first, waits for margin update, safe sizing
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== UPGRADED TOP100 PICKER BOT STARTING (STRICT SINGLE POSITION) ===", flush=True)
+print("=== UPGRADED TOP100 PICKER BOT STARTING (STRICT SINGLE + SAFE MARGIN) ===", flush=True)
 print("Grok 4.1 Thinking + Two-Stage Deep First-Principles mode active", flush=True)
 
 load_dotenv()
@@ -23,7 +23,7 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
-MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "1.0"))
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "0.8"))  # lowered slightly for safety
 
 # === CHECK KEYS ===
 missing = []
@@ -46,7 +46,7 @@ exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO futures", flush=True)
 
 async def close_all_positions():
-    """Closes ALL open positions before opening a new one"""
+    """Closes ALL open positions and waits for margin to update"""
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -56,6 +56,7 @@ async def close_all_positions():
                 amount = abs(float(pos['contracts']))
                 exchange.create_market_order(symbol, side, amount)
                 print(f"   🔄 Closed existing position: {symbol}", flush=True)
+        await asyncio.sleep(2)  # Give Binance time to update available margin
     except Exception as e:
         print(f"   ⚠️ Error closing positions: {e}", flush=True)
 
@@ -149,22 +150,30 @@ async def execute(decision):
         # === STRICT SINGLE POSITION RULE ===
         await close_all_positions()
 
-        # Fetch fresh live price
+        # Fetch fresh price and available margin
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
-       
+        balance = exchange.fetch_balance()
+        available_usdt = balance['free'].get('USDT', 0)
+
+        # Conservative sizing based on actual available margin
+        max_size_usdt = min(decision["size_usdt"], available_usdt * 0.8)  # 80% safety buffer
+        if max_size_usdt < 50:  # too small
+            print("   ⚠️ Available margin too low to open new position", flush=True)
+            return
+
         exchange.set_leverage(decision["leverage"], symbol)
         side = "buy" if decision["action"] == "long" else "sell"
-        amount = decision["size_usdt"] / current_price
+        amount = max_size_usdt / current_price
         exchange.create_market_order(symbol, side, amount)
        
-        print(f" ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
+        print(f" ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${max_size_usdt:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
         print(f" 💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
     except Exception as e:
         print(f" ❌ Execution error on {symbol}: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Strict Single Position) is now RUNNING on DEMO", flush=True)
+    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Strict Single Position + Safe Margin) is now RUNNING on DEMO", flush=True)
     while True:
         try:
             candidates = await get_top_candidates(25)
