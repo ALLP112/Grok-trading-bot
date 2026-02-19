@@ -1,5 +1,5 @@
 """
-FINAL GROK TRADING BOT — 100% Grok 4.20 (SuperGrok Heavy style ready)
+FINAL GROK TRADING BOT — 100% Grok 4.1 Thinking (profit-optimized)
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -7,13 +7,13 @@ import os
 import sys
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, UTC
 from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
 print("=== GROK TRADING BOT STARTING (FINAL Binance v1) ===", flush=True)
-print("Grok 4.20 + SuperGrok Heavy style prompt active", flush=True)
+print("Grok 4.1 Thinking + AlphaEdge Pro profit-optimized prompt active", flush=True)
 
 load_dotenv()
 
@@ -60,26 +60,42 @@ async def get_live_data():
     }
 
 async def grok_decision(data):
-    prompt = f"""You are running in full 16-agent SuperGrok Heavy mode.
-Current time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
-Asset: {SYMBOL}
-Price: {data['price']}
-Funding rate: {data['funding_rate']}
-Balance: {data['balance']} USDT
-Timeframe: next {INTERVAL_MINUTES} minutes.
+    prompt = f"""You are **AlphaEdge Pro**, a battle-tested elite crypto perpetuals trader who has generated consistent profits in live high-stakes environments (including top-performing runs in Alpha Arena crypto perps with real capital).
 
-Return ONLY valid JSON:
+You only take trades with **clear statistical edge**, positive expected value after fees/slippage, and favorable risk-reward (minimum 2:1). You never force trades in chop or low-conviction setups. Your priority is long-term compounding with strict drawdown protection.
+
+Current snapshot:
+- Time (UTC): {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
+- Asset: {SYMBOL}
+- Price: ${data['price']:,.2f}
+- Funding Rate: {data['funding_rate']*100:.4f}%
+- Balance: ${data['balance']:,.2f} USDT
+- Timeframe: next {INTERVAL_MINUTES} minutes
+
+Perform rigorous multi-angle analysis:
+1. Technical structure (multi-timeframe, order blocks, liquidity pools, momentum, volume profile)
+2. Funding rate regime and implied bias
+3. Real-time X sentiment & narrative (Grok native firehose advantage — whale/smart money positioning)
+4. On-chain flows and exchange inflows/outflows
+5. Macro regime and correlations
+6. Liquidity, open interest, and liquidation heat
+
+Calculate expected edge. Only trade if you have high conviction and asymmetry.
+
+Return **ONLY** valid JSON, nothing else:
+
 {{
-  "action": "long" or "short" or "close" or "hold",
-  "leverage": number 1-10,
-  "size_usdt": number (max {MAX_RISK_PERCENT}% risk),
+  "action": "long" | "short" | "close" | "hold",
+  "leverage": integer 1-12,
+  "size_usdt": number (strictly respect max {MAX_RISK_PERCENT}% account risk),
   "stop_loss": number,
   "take_profit": number or null,
-  "confidence": number 0.00-1.00,
-  "reason": "short explanation"
+  "confidence": float 0.00-1.00,
+  "reason": "concise 1-2 sentence synthesis of the edge",
+  "key_risks": ["bullet point 1", "bullet point 2"]
 }}
 
-Only trade if confidence > 0.65."""
+Strict rule: Only take long or short if confidence >= 0.74 **AND** risk-reward is at least 2:1. Otherwise always "hold". Never over-leverage or chase."""
 
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
@@ -111,14 +127,14 @@ async def execute(decision, data):
         print(f"   ❌ Execution error: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Grok Binance Auto-Trader (Grok 4.20 Heavy style) is now RUNNING on DEMO", flush=True)
+    print("🚀 Grok Binance Auto-Trader (Grok 4.1 Thinking + AlphaEdge Pro) is now RUNNING on DEMO", flush=True)
     print(f"📊 Trading {SYMBOL} every {INTERVAL_MINUTES} minutes", flush=True)
     print(f"⚙️  Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
     print("=" * 60, flush=True)
     while True:
         try:
             data = await get_live_data()
-            print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] {SYMBOL} — ${data['price']:,.2f} | Balance: ${data['balance']:,.2f} USDT", flush=True)
+            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] {SYMBOL} — ${data['price']:,.2f} | Balance: ${data['balance']:,.2f} USDT", flush=True)
             decision = await grok_decision(data)
             print(f"   🤖 Grok says: {decision.get('action', 'unknown')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
             await execute(decision, data)
