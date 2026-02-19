@@ -1,6 +1,6 @@
 """
-UPGRADED TOP100 PICKER BOT — Strict Single Position + Robust Margin Handling
-Closes any open position first, waits for margin update, safe sizing
+UPGRADED TOP100 PICKER BOT — Multi-Position + Independent Per-Coin Management
+Only closes a coin if Grok specifically decides "close" for that coin
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -13,8 +13,8 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== UPGRADED TOP100 PICKER BOT STARTING (STRICT SINGLE + SAFE MARGIN) ===", flush=True)
-print("Grok 4.1 Thinking + Two-Stage Deep First-Principles mode active", flush=True)
+print("=== TOP100 PICKER BOT STARTING (MULTI-POSITION MODE) ===", flush=True)
+print("Grok 4.1 Thinking + Independent Per-Coin Management active", flush=True)
 
 load_dotenv()
 
@@ -23,7 +23,7 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
-MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "0.8"))  # lowered slightly for safety
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "1.0"))
 
 # === CHECK KEYS ===
 missing = []
@@ -45,20 +45,21 @@ exchange = ccxt.binance({
 exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO futures", flush=True)
 
-async def close_all_positions():
-    """Closes ALL open positions and waits for margin to update"""
+async def get_current_positions():
     try:
         positions = exchange.fetch_positions()
+        open_pos = []
         for pos in positions:
             if float(pos['contracts']) != 0:
-                symbol = pos['symbol']
-                side = 'sell' if float(pos['contracts']) > 0 else 'buy'
-                amount = abs(float(pos['contracts']))
-                exchange.create_market_order(symbol, side, amount)
-                print(f"   🔄 Closed existing position: {symbol}", flush=True)
-        await asyncio.sleep(2)  # Give Binance time to update available margin
-    except Exception as e:
-        print(f"   ⚠️ Error closing positions: {e}", flush=True)
+                open_pos.append({
+                    'symbol': pos['symbol'],
+                    'side': 'long' if float(pos['contracts']) > 0 else 'short',
+                    'size': abs(float(pos['contracts'])),
+                    'entry_price': float(pos['entryPrice'])
+                })
+        return open_pos
+    except:
+        return []
 
 async def get_top_candidates(n=25):
     markets = exchange.load_markets()
@@ -72,13 +73,10 @@ async def get_top_candidates(n=25):
             market.get('active', False)):
             
             try:
-                funding_info = exchange.fetch_funding_rate(symbol)
-                funding = funding_info.get('fundingRate', 0.0)
+                funding = exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
             except:
                 funding = 0.0
-                
             vol = ticker.get('quoteVolume') or 0
-           
             candidates.append({
                 'symbol': symbol,
                 'price': ticker['last'],
@@ -86,48 +84,48 @@ async def get_top_candidates(n=25):
                 'volume': vol,
                 'funding': funding
             })
-   
     candidates.sort(key=lambda x: x['volume'], reverse=True)
     return candidates[:n]
 
-async def grok_decision(candidates):
-    data_str = "\n".join([
-        f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B"
-        for c in candidates
-    ])
+async def grok_decision(candidates, open_positions):
+    data_str = "\n".join([f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B" for c in candidates])
+    pos_str = "\n".join([f"{p['symbol']} {p['side']} ({p['size']} @ ${p['entry_price']:.2f})" for p in open_positions]) or "No open positions"
+
     prompt = f"""You are AlphaEdge Pro, a first-principles crypto perpetuals trader.
+
 Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
 Timeframe: next {INTERVAL_MINUTES} minutes
+Currently open positions: {pos_str}
+
 Top 25 candidates by volume:
 {data_str}
-Stage 1: Quick filter — identify the 6–8 most promising coins based on order flow imbalance, liquidity, positioning, and asymmetry.
-Stage 2: Deep first-principles analysis on those 6–8 coins only. For each, explain:
-- Net aggressive order flow
-- Liquidity consumption vs provision
-- Forced flows / positioning pressure
-- Information asymmetry & narrative
-- Psychological feedback loops
-Then pick the **single best** long or short setup (or hold if no real edge).
+
+Stage 1: Quick filter — identify the 6–8 most promising coins.
+Stage 2: Deep first-principles analysis on those 6–8 coins.
+Then decide the **single best action** right now (you can open a new position on a new coin while keeping existing ones open).
+
 Return ONLY valid JSON:
 {{
   "symbol": "e.g. SOLUSDT",
-  "action": "long" | "short" | "hold",
+  "action": "long" | "short" | "close" | "hold",
   "leverage": 1-12,
   "size_usdt": number (respect {MAX_RISK_PERCENT}% risk),
   "stop_loss": number,
   "take_profit": number or null,
   "confidence": 0.00-1.00,
-  "reason": "concise 1-2 sentence first-principles explanation of why this is the best edge",
-  "key_risks": ["bullet 1", "bullet 2"]
+  "reason": "concise 1-2 sentence first-principles explanation"
 }}
-Only trade if confidence >= 0.76 and R:R >= 2.2:1."""
+
+Only open or reverse if confidence >= 0.76 and R:R >= 2.2:1.
+Only return "close" if you want to close that specific coin."""
+
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
         max_tokens=1200
     )
-   
+    
     try:
         text = response.choices[0].message.content.strip()
         if "```json" in text:
@@ -143,42 +141,48 @@ async def execute(decision):
 
     symbol = decision.get("symbol")
     if not symbol:
-        print(" ❌ No symbol in decision", flush=True)
         return
 
     try:
-        # === STRICT SINGLE POSITION RULE ===
-        await close_all_positions()
-
-        # Fetch fresh price and available margin
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
-        balance = exchange.fetch_balance()
-        available_usdt = balance['free'].get('USDT', 0)
 
-        # Conservative sizing based on actual available margin
-        max_size_usdt = min(decision["size_usdt"], available_usdt * 0.8)  # 80% safety buffer
-        if max_size_usdt < 50:  # too small
-            print("   ⚠️ Available margin too low to open new position", flush=True)
+        if decision["action"] == "close":
+            await close_position(symbol)
             return
 
+        # Open or reverse the position (no auto-close of other coins)
         exchange.set_leverage(decision["leverage"], symbol)
         side = "buy" if decision["action"] == "long" else "sell"
-        amount = max_size_usdt / current_price
+        amount = decision["size_usdt"] / current_price
         exchange.create_market_order(symbol, side, amount)
-       
-        print(f" ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${max_size_usdt:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
+
+        print(f" ✅ EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x @ ${current_price:,.2f}", flush=True)
         print(f" 💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
+
     except Exception as e:
         print(f" ❌ Execution error on {symbol}: {e}", flush=True)
 
+async def close_position(symbol):
+    try:
+        positions = exchange.fetch_positions([symbol])
+        for pos in positions:
+            if float(pos['contracts']) != 0:
+                side = 'sell' if float(pos['contracts']) > 0 else 'buy'
+                amount = abs(float(pos['contracts']))
+                exchange.create_market_order(symbol, side, amount)
+                print(f"   🔄 Closed position: {symbol}", flush=True)
+    except Exception as e:
+        print(f"   ⚠️ Error closing {symbol}: {e}", flush=True)
+
 async def main_loop():
-    print("🚀 Upgraded Top100 Picker Bot (Deep Two-Stage + Strict Single Position + Safe Margin) is now RUNNING on DEMO", flush=True)
+    print("🚀 Top100 Picker Bot (Multi-Position + Independent Per-Coin) is now RUNNING on DEMO", flush=True)
     while True:
         try:
+            open_pos = await get_current_positions()
             candidates = await get_top_candidates(25)
-            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] Scanning top 25 → deep analysis...", flush=True)
-            decision = await grok_decision(candidates)
+            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] Scanning top 25 → deep analysis... (Open positions: {len(open_pos)})", flush=True)
+            decision = await grok_decision(candidates, open_pos)
             print(f" 🤖 Grok picks: {decision.get('symbol')} {decision.get('action')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
             await execute(decision)
         except Exception as e:
