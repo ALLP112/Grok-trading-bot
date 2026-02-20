@@ -1,5 +1,6 @@
 """
-FINAL GROK TRADING BOT — 100% Grok 4.1 Thinking (first-principles + profit-optimized)
+HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Aggressive Isolated Margin)
+Scans top 100 coins, only one position open at once, closes current before new
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -12,8 +13,8 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== GROK TRADING BOT STARTING (FINAL Binance v1) ===", flush=True)
-print("Grok 4.1 Thinking + First-Principles AlphaEdge Pro prompt active", flush=True)
+print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
+print("Grok 4.1 Thinking + Aggressive High-Leverage First-Principles mode active", flush=True)
 
 load_dotenv()
 
@@ -21,18 +22,16 @@ load_dotenv()
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
-MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "1.0"))
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.0"))  # Higher risk tolerance for high-leverage style
 
-# === CHECK REQUIRED KEYS ===
+# === CHECK KEYS ===
 missing = []
 if not XAI_API_KEY: missing.append("XAI_API_KEY")
 if not BINANCE_API_KEY: missing.append("BINANCE_API_KEY")
 if not BINANCE_API_SECRET: missing.append("BINANCE_API_SECRET")
 if missing:
-    print(f"❌ FATAL: Missing environment variables: {', '.join(missing)}", flush=True)
-    print("Set them in Render Dashboard → Environment tab", flush=True)
+    print(f"❌ FATAL: Missing: {', '.join(missing)}", flush=True)
     sys.exit(1)
 
 client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
@@ -44,59 +43,89 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 exchange.enable_demo_trading(True)
-print("✅ Connected to Binance DEMO futures (demo-fapi.binance.com)", flush=True)
+print("✅ Connected to Binance DEMO futures", flush=True)
 
-async def get_live_data():
-    ticker = exchange.fetch_ticker(SYMBOL)
-    funding = exchange.fetch_funding_rate(SYMBOL)
-    balance = exchange.fetch_balance()['total'].get('USDT', 0)
-    return {
-        "price": ticker['last'],
-        "funding_rate": funding['fundingRate'],
-        "balance": balance
-    }
+async def close_all_positions():
+    """Always close any existing position before opening a new one"""
+    try:
+        positions = exchange.fetch_positions()
+        for pos in positions:
+            if float(pos['contracts']) != 0:
+                symbol = pos['symbol']
+                side = 'sell' if float(pos['contracts']) > 0 else 'buy'
+                amount = abs(float(pos['contracts']))
+                exchange.create_market_order(symbol, side, amount)
+                print(f"   🔄 Closed existing position: {symbol}", flush=True)
+        await asyncio.sleep(2)  # Allow Binance to update available margin
+    except Exception as e:
+        print(f"   ⚠️ Error closing positions: {e}", flush=True)
 
-async def grok_decision(data):
-    prompt = f"""You are **AlphaEdge Pro**, a first-principles crypto perpetuals trader who thinks like a physicist of markets.
+async def get_top_candidates(n=25):
+    markets = exchange.load_markets()
+    tickers = exchange.fetch_tickers()
+    candidates = []
+    for symbol, ticker in tickers.items():
+        market = markets.get(symbol, {})
+        if (symbol.endswith('USDT') and
+            market.get('swap', False) and
+            market.get('contractType') == 'PERPETUAL' and
+            market.get('active', False)):
+            
+            try:
+                funding = exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
+            except:
+                funding = 0.0
+            vol = ticker.get('quoteVolume') or 0
+            candidates.append({
+                'symbol': symbol,
+                'price': ticker['last'],
+                'change24h': ticker.get('percentage', 0),
+                'volume': vol,
+                'funding': funding
+            })
+    candidates.sort(key=lambda x: x['volume'], reverse=True)
+    return candidates[:n]
 
-Price moves **only** because of imbalance between aggressive buying and selling pressure. This imbalance arises from:
-- Net order flow (who is hitting bids/offers harder)
-- Liquidity consumption vs provision (where stops cluster, where resting liquidity sits)
-- Positioning & forced flows (funding payments, liquidations, deleveraging)
-- Information asymmetry (whales, smart money, on-chain signals, narrative consensus)
-- Psychological feedback loops (FOMO, capitulation, herd behaviour)
-- Macro capital allocation (risk-on/risk-off, correlation flows)
+async def grok_decision(candidates):
+    data_str = "\n".join([f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B" for c in candidates])
 
-Current snapshot:
-- Time (UTC): {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
-- Asset: {SYMBOL}
-- Price: ${data['price']:,.2f}
-- Funding Rate: {data['funding_rate']*100:.4f}%
-- Balance: ${data['balance']:,.2f} USDT
-- Timeframe: next {INTERVAL_MINUTES} minutes
+    prompt = f"""You are **AlphaEdge High-Leverage**, an aggressive first-principles crypto perpetuals trader who excels at high-leverage momentum plays on isolated margin.
 
-Reason step-by-step from first principles above. Then calculate true statistical edge after slippage and funding.
+You actively seek strong, fast-moving imbalances that justify high leverage (10-20x). You are willing to take significant risk on high-conviction setups with clear asymmetry and momentum.
 
-Return **ONLY** valid JSON, nothing else:
+Price moves because of:
+- Net aggressive order flow imbalance
+- Liquidity consumption and sweep
+- Forced flows (liquidations, deleveraging)
+- Information asymmetry (whales, on-chain, narrative)
+- Psychological feedback loops (squeeze, FOMO)
 
+Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
+Timeframe: next {INTERVAL_MINUTES} minutes
+Top 25 candidates by volume:
+{data_str}
+
+Perform deep first-principles analysis and pick the **single best** high-leverage long or short setup (or hold if no strong edge).
+
+Return ONLY valid JSON:
 {{
+  "symbol": "e.g. SOLUSDT",
   "action": "long" | "short" | "close" | "hold",
-  "leverage": integer 1-12,
-  "size_usdt": number (strictly respect max {MAX_RISK_PERCENT}% account risk),
+  "leverage": integer 1-20,
+  "size_usdt": number (respect {MAX_RISK_PERCENT}% risk),
   "stop_loss": number,
   "take_profit": number or null,
-  "confidence": float 0.00-1.00,
-  "reason": "concise 1-2 sentence synthesis of the first-principles edge",
-  "key_risks": ["bullet point 1", "bullet point 2"]
+  "confidence": 0.00-1.00,
+  "reason": "concise 1-2 sentence explanation of the high-leverage edge"
 }}
 
-Strict rule: Only take long or short if confidence >= 0.76 **AND** expected risk-reward >= 2.2:1. Otherwise always "hold". Never chase or over-leverage."""
+Only take the trade if confidence >= 0.74 and you see strong asymmetry for a fast move. Use high leverage (12-20x) when conviction is high. Use isolated margin."""
 
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=900
+        temperature=0.75,
+        max_tokens=1100
     )
     
     try:
@@ -107,32 +136,47 @@ Strict rule: Only take long or short if confidence >= 0.76 **AND** expected risk
     except:
         return {"action": "hold", "confidence": 0}
 
-async def execute(decision, data):
+async def execute(decision):
     if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
-        print(f"   ⏸️ HOLD — confidence {decision.get('confidence', 0):.2f} | Reason: {decision.get('reason', 'n/a')}", flush=True)
+        print(f" ⏸️ HOLD — best candidate was {decision.get('symbol', 'none')} (confidence {decision.get('confidence', 0):.2f})", flush=True)
         return
+
+    symbol = decision.get("symbol")
+    if not symbol:
+        return
+
     try:
-        exchange.set_leverage(decision["leverage"], SYMBOL)
+        # Strict single position: always close existing first
+        await close_all_positions()
+
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+
+        # Set isolated margin
+        exchange.set_margin_mode('isolated', symbol)
+
+        leverage = min(decision.get("leverage", 15), 20)
+        exchange.set_leverage(leverage, symbol)
+
         side = "buy" if decision["action"] == "long" else "sell"
-        amount = decision["size_usdt"] / data["price"]
-        exchange.create_market_order(SYMBOL, side, amount)
-        print(f"   ✅ EXECUTED {decision['action'].upper()} | Size ${decision['size_usdt']:.0f} | Leverage {decision['leverage']}x", flush=True)
-        print(f"   💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
+        amount = decision["size_usdt"] / current_price
+        exchange.create_market_order(symbol, side, amount)
+
+        print(f" 🔥 EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {leverage}x @ ${current_price:,.2f} (Isolated)", flush=True)
+        print(f" 💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
+
     except Exception as e:
-        print(f"   ❌ Execution error: {e}", flush=True)
+        print(f" ❌ Execution error on {symbol}: {e}", flush=True)
 
 async def main_loop():
-    print("🚀 Grok Binance Auto-Trader (Grok 4.1 Thinking + First-Principles AlphaEdge Pro) is now RUNNING on DEMO", flush=True)
-    print(f"📊 Trading {SYMBOL} every {INTERVAL_MINUTES} minutes", flush=True)
-    print(f"⚙️ Max risk per trade: {MAX_RISK_PERCENT}%", flush=True)
-    print("=" * 60, flush=True)
+    print("🚀 High Leverage Top100 Scanner (Grok 4.1 Thinking + Isolated Margin) is now RUNNING on DEMO", flush=True)
     while True:
         try:
-            data = await get_live_data()
-            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] {SYMBOL} — ${data['price']:,.2f} | Balance: ${data['balance']:,.2f} USDT", flush=True)
-            decision = await grok_decision(data)
-            print(f"   🤖 Grok says: {decision.get('action', 'unknown')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
-            await execute(decision, data)
+            candidates = await get_top_candidates(25)
+            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] Scanning top 25 for high-leverage edge...", flush=True)
+            decision = await grok_decision(candidates)
+            print(f" 🤖 Grok picks: {decision.get('symbol')} {decision.get('action')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
+            await execute(decision)
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
         await asyncio.sleep(INTERVAL_MINUTES * 60)
