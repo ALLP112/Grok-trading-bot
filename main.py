@@ -23,7 +23,7 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
-MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.0"))  # Higher risk tolerance for high-leverage style
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))  # Higher risk for aggressive high-leverage style
 
 # === CHECK KEYS ===
 missing = []
@@ -45,8 +45,8 @@ exchange = ccxt.binance({
 exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO futures", flush=True)
 
-async def close_all_positions():
-    """Always close any existing position before opening a new one"""
+async def close_current_position():
+    """Closes the current position (if any) before opening a new one"""
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -55,10 +55,10 @@ async def close_all_positions():
                 side = 'sell' if float(pos['contracts']) > 0 else 'buy'
                 amount = abs(float(pos['contracts']))
                 exchange.create_market_order(symbol, side, amount)
-                print(f"   🔄 Closed existing position: {symbol}", flush=True)
-        await asyncio.sleep(2)  # Allow Binance to update available margin
+                print(f"   🔄 Closed current position: {symbol}", flush=True)
+        await asyncio.sleep(2)  # Allow Binance to update margin
     except Exception as e:
-        print(f"   ⚠️ Error closing positions: {e}", flush=True)
+        print(f"   ⚠️ Error closing current position: {e}", flush=True)
 
 async def get_top_candidates(n=25):
     markets = exchange.load_markets()
@@ -89,16 +89,9 @@ async def get_top_candidates(n=25):
 async def grok_decision(candidates):
     data_str = "\n".join([f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B" for c in candidates])
 
-    prompt = f"""You are **AlphaEdge High-Leverage**, an aggressive first-principles crypto perpetuals trader who excels at high-leverage momentum plays on isolated margin.
+    prompt = f"""You are **AlphaEdge High-Leverage**, an aggressive first-principles trader specializing in high-leverage (10-20x) isolated margin plays on Binance futures.
 
-You actively seek strong, fast-moving imbalances that justify high leverage (10-20x). You are willing to take significant risk on high-conviction setups with clear asymmetry and momentum.
-
-Price moves because of:
-- Net aggressive order flow imbalance
-- Liquidity consumption and sweep
-- Forced flows (liquidations, deleveraging)
-- Information asymmetry (whales, on-chain, narrative)
-- Psychological feedback loops (squeeze, FOMO)
+You actively seek strong, fast-moving imbalances that justify high leverage and significant risk when the edge is clear.
 
 Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
 Timeframe: next {INTERVAL_MINUTES} minutes
@@ -119,7 +112,7 @@ Return ONLY valid JSON:
   "reason": "concise 1-2 sentence explanation of the high-leverage edge"
 }}
 
-Only take the trade if confidence >= 0.74 and you see strong asymmetry for a fast move. Use high leverage (12-20x) when conviction is high. Use isolated margin."""
+Only take the trade if confidence >= 0.74. Use high leverage (12-20x) when conviction is high. Use isolated margin only."""
 
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
@@ -146,9 +139,10 @@ async def execute(decision):
         return
 
     try:
-        # Strict single position: always close existing first
-        await close_all_positions()
+        # Always close current position before opening a new one (strict single position)
+        await close_current_position()
 
+        # Fetch fresh price
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
 
