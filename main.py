@@ -2,6 +2,7 @@
 HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
 Scans top 100 coins, strictly one position at a time
 Position closes only when its own SL/TP is hit — never overridden by new signals
+Includes PnL tracking dashboard
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -15,7 +16,7 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
-print("Grok 4.1 Thinking + Cross Margin + Single Position mode", flush=True)
+print("Grok 4.1 Thinking + Cross Margin + Single Position + PnL Tracker", flush=True)
 
 load_dotenv()
 
@@ -56,6 +57,138 @@ trading_exchange = ccxt.binance({
 })
 trading_exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
+
+
+# ============================================================
+#  PNL TRACKING
+# ============================================================
+
+trade_log = []  # Stores completed trades this session
+session_start_balance = None
+
+
+def fetch_trade_history():
+    """Fetch recent income history (realized PnL) from Binance."""
+    try:
+        # Binance futures income history includes realized PnL entries
+        incomes = trading_exchange.fapiprivate_get_income({
+            'incomeType': 'REALIZED_PNL',
+            'limit': 100,
+        })
+        return incomes
+    except Exception as e:
+        print(f"   ⚠️ Could not fetch income history: {e}", flush=True)
+        return []
+
+
+def log_trade_open(symbol, action, size_usdt, leverage, entry_price, sl, tp, confidence, reason):
+    """Record a new trade entry."""
+    trade = {
+        'symbol': symbol,
+        'action': action,
+        'size_usdt': size_usdt,
+        'leverage': leverage,
+        'entry_price': entry_price,
+        'sl': sl,
+        'tp': tp,
+        'confidence': confidence,
+        'reason': reason,
+        'opened_at': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        'closed_at': None,
+        'exit_price': None,
+        'pnl': None,
+        'pnl_pct': None,
+        'result': None,
+    }
+    trade_log.append(trade)
+    return trade
+
+
+def log_trade_close(exit_price, pnl):
+    """Update the most recent trade with exit info."""
+    if not trade_log:
+        return
+    trade = trade_log[-1]
+    if trade['closed_at'] is not None:
+        return  # Already closed
+    trade['closed_at'] = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+    trade['exit_price'] = exit_price
+    trade['pnl'] = pnl
+    if trade['size_usdt'] > 0:
+        trade['pnl_pct'] = (pnl / trade['size_usdt']) * 100
+    trade['result'] = 'WIN' if pnl >= 0 else 'LOSS'
+
+
+def print_pnl_dashboard():
+    """Print a summary of all trades this session."""
+    if not trade_log:
+        print("   📊 No completed trades yet this session", flush=True)
+        return
+
+    completed = [t for t in trade_log if t['closed_at'] is not None]
+    active = [t for t in trade_log if t['closed_at'] is None]
+
+    if not completed and not active:
+        return
+
+    total_pnl = sum(t['pnl'] for t in completed if t['pnl'] is not None)
+    wins = sum(1 for t in completed if t['result'] == 'WIN')
+    losses = sum(1 for t in completed if t['result'] == 'LOSS')
+    win_rate = (wins / len(completed) * 100) if completed else 0
+
+    best = max(completed, key=lambda t: t['pnl'] or 0) if completed else None
+    worst = min(completed, key=lambda t: t['pnl'] or 0) if completed else None
+
+    print(f"\n   {'='*50}", flush=True)
+    print(f"   📊 PNL DASHBOARD (Session)", flush=True)
+    print(f"   {'='*50}", flush=True)
+    print(f"   Total trades:  {len(completed)} closed, {len(active)} open", flush=True)
+    print(f"   Total PnL:     ${total_pnl:+,.2f}", flush=True)
+    print(f"   Win rate:      {wins}W / {losses}L ({win_rate:.0f}%)", flush=True)
+    if best and best['pnl'] is not None:
+        print(f"   Best trade:    {best['symbol']} ${best['pnl']:+,.2f} ({best['pnl_pct']:+.1f}%)", flush=True)
+    if worst and worst['pnl'] is not None:
+        print(f"   Worst trade:   {worst['symbol']} ${worst['pnl']:+,.2f} ({worst['pnl_pct']:+.1f}%)", flush=True)
+
+    # Recent trade history (last 10)
+    print(f"   {'-'*50}", flush=True)
+    print(f"   Recent trades:", flush=True)
+    for t in completed[-10:]:
+        icon = '✅' if t['result'] == 'WIN' else '❌'
+        print(f"   {icon} {t['symbol']} {t['action'].upper()} {t['leverage']}x | "
+              f"${t['entry_price']:,.2f} → ${t['exit_price']:,.2f} | "
+              f"PnL: ${t['pnl']:+,.2f} ({t['pnl_pct']:+.1f}%) | "
+              f"{t['opened_at'][:16]}", flush=True)
+
+    if active:
+        print(f"   {'-'*50}", flush=True)
+        for t in active:
+            print(f"   🔄 OPEN: {t['symbol']} {t['action'].upper()} {t['leverage']}x | "
+                  f"Entry ${t['entry_price']:,.2f} | SL ${t['sl']:,.2f} / TP ${t['tp']:,.2f} | "
+                  f"Since {t['opened_at'][:16]}", flush=True)
+
+    print(f"   {'='*50}", flush=True)
+
+
+def print_income_summary():
+    """Fetch and print Binance's own PnL records (survives restarts)."""
+    incomes = fetch_trade_history()
+    if not incomes:
+        return
+
+    total = sum(float(i.get('income', 0)) for i in incomes)
+    count = len(incomes)
+
+    print(f"\n   📈 BINANCE INCOME HISTORY (last {count} realized PnL entries)", flush=True)
+    print(f"   💵 Total realized PnL on account: ${total:+,.2f}", flush=True)
+
+    # Show last 5
+    for i in incomes[-5:]:
+        pnl = float(i.get('income', 0))
+        symbol = i.get('symbol', '???')
+        ts = datetime.fromtimestamp(int(i.get('time', 0)) / 1000, tz=UTC).strftime('%m-%d %H:%M')
+        icon = '✅' if pnl >= 0 else '❌'
+        print(f"   {icon} {symbol}: ${pnl:+,.2f} @ {ts}", flush=True)
 
 
 # ============================================================
@@ -245,6 +378,10 @@ async def execute_trade(decision, balance):
             None, {'stopPrice': tp, 'closePosition': True}
         )
 
+        # Log the trade
+        log_trade_open(symbol, action, size_usdt, leverage, current_price, sl, tp, confidence,
+                       decision.get('reason', ''))
+
         print(f"   🔥 OPENED {action.upper()} {symbol} | ${size_usdt:,.0f} | {leverage}x Cross @ ${current_price:,.2f}", flush=True)
         print(f"   🛑 SL: ${sl:,.2f} | 🎯 TP: ${tp:,.2f}", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
@@ -258,22 +395,38 @@ async def execute_trade(decision, balance):
 # ============================================================
 
 last_position_symbol = None
+had_position_last_cycle = False
 
 async def main_loop():
-    global last_position_symbol
+    global last_position_symbol, had_position_last_cycle, session_start_balance
 
     print("🚀 High Leverage Top100 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
     print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Max risk: {MAX_RISK_PERCENT}%", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
     print("=" * 60, flush=True)
 
+    # Record starting balance
+    try:
+        bal = trading_exchange.fetch_balance()
+        session_start_balance = float(bal['total'].get('USDT', 0))
+        print(f"💰 Session starting balance: ${session_start_balance:,.2f}", flush=True)
+    except Exception:
+        session_start_balance = 0
+
+    # Print Binance income history on startup (survives restarts)
+    print_income_summary()
+
+    cycle_count = 0
+
     while True:
         try:
+            cycle_count += 1
             now = datetime.now(UTC).strftime('%H:%M:%S')
             position = get_open_position()
 
             if position:
                 last_position_symbol = position['symbol']
+                had_position_last_cycle = True
                 pnl = position['unrealized_pnl']
                 pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
                 print(f"\n[{now}] 📍 OPEN: {position['side'].upper()} {position['symbol']} | "
@@ -282,27 +435,66 @@ async def main_loop():
                 print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
 
             else:
-                if last_position_symbol:
+                # Position just closed — log it
+                if had_position_last_cycle and last_position_symbol:
+                    print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
+
+                    # Fetch the realized PnL from Binance
+                    try:
+                        incomes = trading_exchange.fapiprivate_get_income({
+                            'symbol': last_position_symbol.replace('/', ''),
+                            'incomeType': 'REALIZED_PNL',
+                            'limit': 1,
+                        })
+                        if incomes:
+                            realized_pnl = float(incomes[-1].get('income', 0))
+                            # Get exit price from last trade
+                            try:
+                                trades = trading_exchange.fetch_my_trades(last_position_symbol, limit=1)
+                                exit_price = float(trades[-1]['price']) if trades else 0
+                            except Exception:
+                                exit_price = 0
+                            log_trade_close(exit_price, realized_pnl)
+                            icon = '✅' if realized_pnl >= 0 else '❌'
+                            print(f"   {icon} Realized PnL: ${realized_pnl:+,.2f}", flush=True)
+                    except Exception as e:
+                        print(f"   ⚠️ Could not fetch realized PnL: {e}", flush=True)
+
                     cancel_open_orders(last_position_symbol)
                     last_position_symbol = None
+                    had_position_last_cycle = False
 
-                print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
+                    # Print dashboard after every trade closes
+                    print_pnl_dashboard()
 
-                candidates = await get_top_candidates(100)
-                print(f"   📈 Found {len(candidates)} perpetual futures", flush=True)
+                else:
+                    print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
 
-                enriched = await enrich_top_picks(candidates, 25)
+                    candidates = await get_top_candidates(100)
+                    print(f"   📈 Found {len(candidates)} perpetual futures", flush=True)
 
-                balance_data = trading_exchange.fetch_balance()
-                balance = float(balance_data['total'].get('USDT', 0))
-                print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
+                    enriched = await enrich_top_picks(candidates, 25)
 
-                decision = await grok_decision(enriched, balance)
-                print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
-                      f"{decision.get('action', 'hold')} "
-                      f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
+                    balance_data = trading_exchange.fetch_balance()
+                    balance = float(balance_data['total'].get('USDT', 0))
+                    print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
 
-                await execute_trade(decision, balance)
+                    # Show session PnL
+                    if session_start_balance > 0:
+                        session_pnl = balance - session_start_balance
+                        print(f"   📊 Session PnL: ${session_pnl:+,.2f} ({session_pnl / session_start_balance * 100:+.2f}%)", flush=True)
+
+                    decision = await grok_decision(enriched, balance)
+                    print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
+                          f"{decision.get('action', 'hold')} "
+                          f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
+
+                    await execute_trade(decision, balance)
+
+            # Print full dashboard every 10 cycles
+            if cycle_count % 10 == 0:
+                print_pnl_dashboard()
+                print_income_summary()
 
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
