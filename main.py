@@ -1,7 +1,6 @@
 """
 HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
-Scans top 100 coins, strictly one position at a time
-Position closes only when its own SL/TP is hit — never overridden by new signals
+DEBUG VERSION — extra logging to diagnose market scanning
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -14,7 +13,7 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
+print("=== HIGH LEVERAGE TOP100 SCANNER STARTING (DEBUG) ===", flush=True)
 print("Grok 4.1 Thinking + Cross Margin + Single Position mode", flush=True)
 
 load_dotenv()
@@ -40,14 +39,14 @@ if missing:
 
 client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# PUBLIC exchange — live Binance for market data (no keys needed)
+# PUBLIC exchange — live Binance for market data
 public_exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'},
 })
 print("✅ Connected to Binance LIVE for market data", flush=True)
 
-# PRIVATE exchange — demo Binance for trading (orders, balance, positions)
+# PRIVATE exchange — demo Binance for trading
 trading_exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
@@ -55,7 +54,7 @@ trading_exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 trading_exchange.enable_demo_trading(True)
-print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
+print("✅ Connected to Binance DEMO for trading", flush=True)
 
 
 # ============================================================
@@ -63,7 +62,6 @@ print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
 # ============================================================
 
 def get_open_position():
-    """Returns the single open position dict, or None if flat."""
     try:
         positions = trading_exchange.fetch_positions()
         for pos in positions:
@@ -85,7 +83,6 @@ def get_open_position():
 
 
 def cancel_open_orders(symbol):
-    """Cancel all open orders for a symbol (cleanup after SL/TP hit)."""
     try:
         open_orders = trading_exchange.fetch_open_orders(symbol)
         for order in open_orders:
@@ -97,35 +94,93 @@ def cancel_open_orders(symbol):
 
 
 # ============================================================
-#  MARKET SCANNING (uses live public data)
+#  MARKET SCANNING — DEBUG VERSION
 # ============================================================
 
 async def get_top_candidates(n=100):
-    """Fetch top N futures coins by 24h volume from live Binance."""
+    """Fetch top N futures coins by 24h volume — with debug logging."""
+    
+    print("   [DEBUG] Loading markets...", flush=True)
     markets = public_exchange.load_markets()
+    print(f"   [DEBUG] Total markets loaded: {len(markets)}", flush=True)
+    
+    # Show 3 sample market keys and their properties
+    sample_count = 0
+    for symbol, market in markets.items():
+        if sample_count < 3:
+            print(f"   [DEBUG] Sample market: {symbol} -> type={market.get('type')}, swap={market.get('swap')}, "
+                  f"contractType={market.get('contractType')}, active={market.get('active')}, "
+                  f"quote={market.get('quote')}, settle={market.get('settle')}", flush=True)
+            sample_count += 1
+    
+    print("   [DEBUG] Fetching tickers...", flush=True)
     tickers = public_exchange.fetch_tickers()
+    print(f"   [DEBUG] Total tickers fetched: {len(tickers)}", flush=True)
+    
+    # Show 3 sample ticker keys
+    sample_count = 0
+    for symbol in tickers:
+        if sample_count < 3:
+            print(f"   [DEBUG] Sample ticker key: {symbol}", flush=True)
+            sample_count += 1
+    
+    # Try to find matches with relaxed filters step by step
+    usdt_tickers = [s for s in tickers if 'USDT' in s]
+    print(f"   [DEBUG] Tickers containing 'USDT': {len(usdt_tickers)}", flush=True)
+    
+    in_markets = [s for s in usdt_tickers if s in markets]
+    print(f"   [DEBUG] Also in markets dict: {len(in_markets)}", flush=True)
+    
+    swap_matches = [s for s in in_markets if markets[s].get('swap')]
+    print(f"   [DEBUG] With swap=True: {len(swap_matches)}", flush=True)
+    
+    perp_matches = [s for s in swap_matches if markets[s].get('contractType') == 'PERPETUAL']
+    print(f"   [DEBUG] With contractType=PERPETUAL: {len(perp_matches)}", flush=True)
+    
+    active_matches = [s for s in perp_matches if markets[s].get('active')]
+    print(f"   [DEBUG] With active=True: {len(active_matches)}", flush=True)
+    
+    # If the strict filter fails, show what contractTypes exist
+    if len(perp_matches) == 0 and len(swap_matches) > 0:
+        contract_types = set(markets[s].get('contractType') for s in swap_matches)
+        print(f"   [DEBUG] Available contractTypes: {contract_types}", flush=True)
+    
+    # If swap filter fails, show what types exist
+    if len(swap_matches) == 0 and len(in_markets) > 0:
+        types = set(markets[s].get('type') for s in in_markets[:20])
+        swaps = set(markets[s].get('swap') for s in in_markets[:20])
+        print(f"   [DEBUG] Market types: {types}, swap values: {swaps}", flush=True)
+    
+    # If nothing matches markets, check key format mismatch
+    if len(in_markets) == 0 and len(usdt_tickers) > 0:
+        print(f"   [DEBUG] KEY MISMATCH — ticker keys don't match market keys", flush=True)
+        print(f"   [DEBUG] First 3 ticker keys: {list(tickers.keys())[:3]}", flush=True)
+        print(f"   [DEBUG] First 3 market keys: {list(markets.keys())[:3]}", flush=True)
+    
+    # Build candidate list using the working filter
     candidates = []
-
     for symbol, ticker in tickers.items():
         market = markets.get(symbol, {})
-        if (symbol.endswith('USDT')
+        if (('USDT' in symbol)
                 and market.get('swap', False)
-                and market.get('contractType') == 'PERPETUAL'
                 and market.get('active', False)):
-            vol = ticker.get('quoteVolume') or 0
-            candidates.append({
-                'symbol': symbol,
-                'price': ticker.get('last', 0),
-                'change24h': ticker.get('percentage', 0),
-                'volume': vol,
-            })
+            # Accept any perpetual-like contract
+            ct = market.get('contractType', '')
+            if ct in ('PERPETUAL', 'perpetual', None, ''):
+                vol = ticker.get('quoteVolume') or 0
+                candidates.append({
+                    'symbol': symbol,
+                    'price': ticker.get('last', 0),
+                    'change24h': ticker.get('percentage', 0),
+                    'volume': vol,
+                })
 
+    print(f"   [DEBUG] Final candidates (relaxed filter): {len(candidates)}", flush=True)
     candidates.sort(key=lambda x: x['volume'], reverse=True)
     return candidates[:n]
 
 
 async def enrich_top_picks(candidates, top_n=25):
-    """Fetch funding rates for the top N candidates."""
     enriched = []
     for c in candidates[:top_n]:
         try:
@@ -195,7 +250,7 @@ Return ONLY valid JSON:
 
 
 # ============================================================
-#  TRADE EXECUTION (uses demo exchange)
+#  TRADE EXECUTION
 # ============================================================
 
 async def execute_trade(decision, balance):
@@ -214,45 +269,36 @@ async def execute_trade(decision, balance):
         return
 
     try:
-        # --- Load markets on demo exchange if not yet loaded ---
         trading_exchange.load_markets()
 
-        # --- Set cross margin and leverage ---
         try:
             trading_exchange.set_margin_mode('cross', symbol)
         except Exception:
-            pass  # Already set to cross — Binance throws error if unchanged
+            pass
 
         leverage = min(decision.get("leverage", 10), 20)
         trading_exchange.set_leverage(leverage, symbol)
 
-        # --- Calculate position size ---
         max_size = balance * MAX_RISK_PERCENT / 100
         size_usdt = min(decision.get("size_usdt", max_size), max_size)
 
-        # Use live price for accurate sizing
         ticker = public_exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         amount = size_usdt / current_price
 
-        # --- Place entry order ---
         entry_side = "buy" if action == "long" else "sell"
         trading_exchange.create_market_order(symbol, entry_side, amount)
 
-        # --- Place stop loss ---
         sl_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
-            None,
-            {'stopPrice': sl, 'closePosition': True}
+            None, {'stopPrice': sl, 'closePosition': True}
         )
 
-        # --- Place take profit ---
         tp_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
-            None,
-            {'stopPrice': tp, 'closePosition': True}
+            None, {'stopPrice': tp, 'closePosition': True}
         )
 
         print(f"   🔥 OPENED {action.upper()} {symbol} | ${size_usdt:,.0f} | {leverage}x Cross @ ${current_price:,.2f}", flush=True)
@@ -280,12 +326,9 @@ async def main_loop():
     while True:
         try:
             now = datetime.now(UTC).strftime('%H:%M:%S')
-
-            # --- Check for existing position ---
             position = get_open_position()
 
             if position:
-                # Position is open — just monitor, do NOT scan for new trades
                 last_position_symbol = position['symbol']
                 pnl = position['unrealized_pnl']
                 pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
@@ -295,32 +338,26 @@ async def main_loop():
                 print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
 
             else:
-                # No position — clean up leftover orders from last trade, then scan
                 if last_position_symbol:
                     cancel_open_orders(last_position_symbol)
                     last_position_symbol = None
 
                 print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
 
-                # Scan markets (live public data)
                 candidates = await get_top_candidates(100)
                 print(f"   📈 Found {len(candidates)} perpetual futures", flush=True)
 
-                # Enrich top 25 with funding rates
                 enriched = await enrich_top_picks(candidates, 25)
 
-                # Get balance (demo account)
                 balance_data = trading_exchange.fetch_balance()
                 balance = float(balance_data['total'].get('USDT', 0))
                 print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
 
-                # Ask Grok
                 decision = await grok_decision(enriched, balance)
                 print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
                       f"{decision.get('action', 'hold')} "
                       f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
 
-                # Execute if confident
                 await execute_trade(decision, balance)
 
         except Exception as e:
