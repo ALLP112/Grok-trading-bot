@@ -1,6 +1,7 @@
 """
 HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
-DEBUG VERSION — extra logging to diagnose market scanning
+Scans top 100 coins, strictly one position at a time
+Position closes only when its own SL/TP is hit — never overridden by new signals
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -13,7 +14,7 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== HIGH LEVERAGE TOP100 SCANNER STARTING (DEBUG) ===", flush=True)
+print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
 print("Grok 4.1 Thinking + Cross Margin + Single Position mode", flush=True)
 
 load_dotenv()
@@ -54,7 +55,7 @@ trading_exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 trading_exchange.enable_demo_trading(True)
-print("✅ Connected to Binance DEMO for trading", flush=True)
+print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
 
 
 # ============================================================
@@ -62,6 +63,7 @@ print("✅ Connected to Binance DEMO for trading", flush=True)
 # ============================================================
 
 def get_open_position():
+    """Returns the single open position dict, or None if flat."""
     try:
         positions = trading_exchange.fetch_positions()
         for pos in positions:
@@ -83,6 +85,7 @@ def get_open_position():
 
 
 def cancel_open_orders(symbol):
+    """Cancel all open orders for a symbol (cleanup after SL/TP hit)."""
     try:
         open_orders = trading_exchange.fetch_open_orders(symbol)
         for order in open_orders:
@@ -94,93 +97,34 @@ def cancel_open_orders(symbol):
 
 
 # ============================================================
-#  MARKET SCANNING — DEBUG VERSION
+#  MARKET SCANNING
 # ============================================================
 
 async def get_top_candidates(n=100):
-    """Fetch top N futures coins by 24h volume — with debug logging."""
-    
-    print("   [DEBUG] Loading markets...", flush=True)
+    """Fetch top N futures coins by 24h volume from live Binance."""
     markets = public_exchange.load_markets()
-    print(f"   [DEBUG] Total markets loaded: {len(markets)}", flush=True)
-    
-    # Show 3 sample market keys and their properties
-    sample_count = 0
-    for symbol, market in markets.items():
-        if sample_count < 3:
-            print(f"   [DEBUG] Sample market: {symbol} -> type={market.get('type')}, swap={market.get('swap')}, "
-                  f"contractType={market.get('contractType')}, active={market.get('active')}, "
-                  f"quote={market.get('quote')}, settle={market.get('settle')}", flush=True)
-            sample_count += 1
-    
-    print("   [DEBUG] Fetching tickers...", flush=True)
     tickers = public_exchange.fetch_tickers()
-    print(f"   [DEBUG] Total tickers fetched: {len(tickers)}", flush=True)
-    
-    # Show 3 sample ticker keys
-    sample_count = 0
-    for symbol in tickers:
-        if sample_count < 3:
-            print(f"   [DEBUG] Sample ticker key: {symbol}", flush=True)
-            sample_count += 1
-    
-    # Try to find matches with relaxed filters step by step
-    usdt_tickers = [s for s in tickers if 'USDT' in s]
-    print(f"   [DEBUG] Tickers containing 'USDT': {len(usdt_tickers)}", flush=True)
-    
-    in_markets = [s for s in usdt_tickers if s in markets]
-    print(f"   [DEBUG] Also in markets dict: {len(in_markets)}", flush=True)
-    
-    swap_matches = [s for s in in_markets if markets[s].get('swap')]
-    print(f"   [DEBUG] With swap=True: {len(swap_matches)}", flush=True)
-    
-    perp_matches = [s for s in swap_matches if markets[s].get('contractType') == 'PERPETUAL']
-    print(f"   [DEBUG] With contractType=PERPETUAL: {len(perp_matches)}", flush=True)
-    
-    active_matches = [s for s in perp_matches if markets[s].get('active')]
-    print(f"   [DEBUG] With active=True: {len(active_matches)}", flush=True)
-    
-    # If the strict filter fails, show what contractTypes exist
-    if len(perp_matches) == 0 and len(swap_matches) > 0:
-        contract_types = set(markets[s].get('contractType') for s in swap_matches)
-        print(f"   [DEBUG] Available contractTypes: {contract_types}", flush=True)
-    
-    # If swap filter fails, show what types exist
-    if len(swap_matches) == 0 and len(in_markets) > 0:
-        types = set(markets[s].get('type') for s in in_markets[:20])
-        swaps = set(markets[s].get('swap') for s in in_markets[:20])
-        print(f"   [DEBUG] Market types: {types}, swap values: {swaps}", flush=True)
-    
-    # If nothing matches markets, check key format mismatch
-    if len(in_markets) == 0 and len(usdt_tickers) > 0:
-        print(f"   [DEBUG] KEY MISMATCH — ticker keys don't match market keys", flush=True)
-        print(f"   [DEBUG] First 3 ticker keys: {list(tickers.keys())[:3]}", flush=True)
-        print(f"   [DEBUG] First 3 market keys: {list(markets.keys())[:3]}", flush=True)
-    
-    # Build candidate list using the working filter
     candidates = []
+
     for symbol, ticker in tickers.items():
         market = markets.get(symbol, {})
-        if (('USDT' in symbol)
+        if ('USDT' in symbol
                 and market.get('swap', False)
-                and market.get('active', False)):
-            # Accept any perpetual-like contract
-            ct = market.get('contractType', '')
-            if ct in ('PERPETUAL', 'perpetual', None, ''):
-                vol = ticker.get('quoteVolume') or 0
-                candidates.append({
-                    'symbol': symbol,
-                    'price': ticker.get('last', 0),
-                    'change24h': ticker.get('percentage', 0),
-                    'volume': vol,
-                })
+                and market.get('active', True)):
+            vol = ticker.get('quoteVolume') or 0
+            candidates.append({
+                'symbol': symbol,
+                'price': ticker.get('last', 0),
+                'change24h': ticker.get('percentage', 0),
+                'volume': vol,
+            })
 
-    print(f"   [DEBUG] Final candidates (relaxed filter): {len(candidates)}", flush=True)
     candidates.sort(key=lambda x: x['volume'], reverse=True)
     return candidates[:n]
 
 
 async def enrich_top_picks(candidates, top_n=25):
+    """Fetch funding rates for the top N candidates."""
     enriched = []
     for c in candidates[:top_n]:
         try:
