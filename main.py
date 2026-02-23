@@ -918,6 +918,29 @@ async def execute_trade(decision, balance):
         sl = round_price(sl, symbol)
         tp = round_price(tp, symbol)
 
+        # Hard R:R check — reject if TP isn't at least 1.8x the SL distance
+        if action == "long":
+            sl_dist = abs(current_price - sl)
+            tp_dist = abs(tp - current_price)
+        else:
+            sl_dist = abs(sl - current_price)
+            tp_dist = abs(current_price - tp)
+
+        if sl_dist > 0:
+            actual_rr = tp_dist / sl_dist
+        else:
+            actual_rr = 0
+
+        if actual_rr < 1.8:
+            original_rr = actual_rr
+            # Auto-fix: keep SL, push TP to 2:1
+            if action == "long":
+                tp = round_price(current_price + (sl_dist * 2.0), symbol)
+            else:
+                tp = round_price(current_price - (sl_dist * 2.0), symbol)
+            actual_rr = 2.0
+            print(f"   ⚠️ R:R was {original_rr:.1f}:1 — TP auto-adjusted to ${tp:,.2f} (2:1)", flush=True)
+
         # === RISK-BASED POSITION SIZING ===
         position_notional, margin_required, risk_amount = calculate_position_size(
             balance, current_price, sl, leverage
