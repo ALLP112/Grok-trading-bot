@@ -40,14 +40,22 @@ if missing:
 
 client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-exchange = ccxt.binance({
+# PUBLIC exchange — live Binance for market data (no keys needed)
+public_exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'},
+})
+print("✅ Connected to Binance LIVE for market data", flush=True)
+
+# PRIVATE exchange — demo Binance for trading (orders, balance, positions)
+trading_exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
     'enableRateLimit': True,
     'options': {'defaultType': 'future'},
 })
-exchange.enable_demo_trading(True)
-print("✅ Connected to Binance DEMO futures (cross margin)", flush=True)
+trading_exchange.enable_demo_trading(True)
+print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
 
 
 # ============================================================
@@ -57,7 +65,7 @@ print("✅ Connected to Binance DEMO futures (cross margin)", flush=True)
 def get_open_position():
     """Returns the single open position dict, or None if flat."""
     try:
-        positions = exchange.fetch_positions()
+        positions = trading_exchange.fetch_positions()
         for pos in positions:
             contracts = float(pos.get('contracts', 0))
             if contracts != 0:
@@ -79,9 +87,9 @@ def get_open_position():
 def cancel_open_orders(symbol):
     """Cancel all open orders for a symbol (cleanup after SL/TP hit)."""
     try:
-        open_orders = exchange.fetch_open_orders(symbol)
+        open_orders = trading_exchange.fetch_open_orders(symbol)
         for order in open_orders:
-            exchange.cancel_order(order['id'], symbol)
+            trading_exchange.cancel_order(order['id'], symbol)
         if open_orders:
             print(f"   🧹 Cancelled {len(open_orders)} leftover orders on {symbol}", flush=True)
     except Exception as e:
@@ -89,13 +97,13 @@ def cancel_open_orders(symbol):
 
 
 # ============================================================
-#  MARKET SCANNING
+#  MARKET SCANNING (uses live public data)
 # ============================================================
 
 async def get_top_candidates(n=100):
-    """Fetch top N futures coins by 24h volume."""
-    markets = exchange.load_markets()
-    tickers = exchange.fetch_tickers()
+    """Fetch top N futures coins by 24h volume from live Binance."""
+    markets = public_exchange.load_markets()
+    tickers = public_exchange.fetch_tickers()
     candidates = []
 
     for symbol, ticker in tickers.items():
@@ -117,11 +125,11 @@ async def get_top_candidates(n=100):
 
 
 async def enrich_top_picks(candidates, top_n=25):
-    """Fetch funding rates for the top N candidates (API-intensive, so limit)."""
+    """Fetch funding rates for the top N candidates."""
     enriched = []
     for c in candidates[:top_n]:
         try:
-            funding = exchange.fetch_funding_rate(c['symbol']).get('fundingRate', 0.0)
+            funding = public_exchange.fetch_funding_rate(c['symbol']).get('fundingRate', 0.0)
         except Exception:
             funding = 0.0
         c['funding'] = funding
@@ -187,7 +195,7 @@ Return ONLY valid JSON:
 
 
 # ============================================================
-#  TRADE EXECUTION
+#  TRADE EXECUTION (uses demo exchange)
 # ============================================================
 
 async def execute_trade(decision, balance):
@@ -206,38 +214,42 @@ async def execute_trade(decision, balance):
         return
 
     try:
+        # --- Load markets on demo exchange if not yet loaded ---
+        trading_exchange.load_markets()
+
         # --- Set cross margin and leverage ---
         try:
-            exchange.set_margin_mode('cross', symbol)
+            trading_exchange.set_margin_mode('cross', symbol)
         except Exception:
             pass  # Already set to cross — Binance throws error if unchanged
 
         leverage = min(decision.get("leverage", 10), 20)
-        exchange.set_leverage(leverage, symbol)
+        trading_exchange.set_leverage(leverage, symbol)
 
         # --- Calculate position size ---
         max_size = balance * MAX_RISK_PERCENT / 100
         size_usdt = min(decision.get("size_usdt", max_size), max_size)
 
-        ticker = exchange.fetch_ticker(symbol)
+        # Use live price for accurate sizing
+        ticker = public_exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         amount = size_usdt / current_price
 
         # --- Place entry order ---
         entry_side = "buy" if action == "long" else "sell"
-        exchange.create_market_order(symbol, entry_side, amount)
+        trading_exchange.create_market_order(symbol, entry_side, amount)
 
-        # --- Place stop loss (closes position when hit) ---
+        # --- Place stop loss ---
         sl_side = "sell" if action == "long" else "buy"
-        exchange.create_order(
+        trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
-            None,  # no limit price for stop market
+            None,
             {'stopPrice': sl, 'closePosition': True}
         )
 
-        # --- Place take profit (closes position when hit) ---
+        # --- Place take profit ---
         tp_side = "sell" if action == "long" else "buy"
-        exchange.create_order(
+        trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
             None,
             {'stopPrice': tp, 'closePosition': True}
@@ -255,7 +267,6 @@ async def execute_trade(decision, balance):
 #  MAIN LOOP
 # ============================================================
 
-# Track the last symbol we had a position in (for order cleanup)
 last_position_symbol = None
 
 async def main_loop():
@@ -291,15 +302,15 @@ async def main_loop():
 
                 print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
 
-                # Scan markets
+                # Scan markets (live public data)
                 candidates = await get_top_candidates(100)
                 print(f"   📈 Found {len(candidates)} perpetual futures", flush=True)
 
                 # Enrich top 25 with funding rates
                 enriched = await enrich_top_picks(candidates, 25)
 
-                # Get balance
-                balance_data = exchange.fetch_balance()
+                # Get balance (demo account)
+                balance_data = trading_exchange.fetch_balance()
                 balance = float(balance_data['total'].get('USDT', 0))
                 print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
 
