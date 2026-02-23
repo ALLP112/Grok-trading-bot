@@ -520,9 +520,17 @@ def get_open_position():
                     lev = int(float(lev)) if lev is not None else 1
                 except (ValueError, TypeError):
                     lev = 1
+
+                # Use ccxt's side field directly — contracts is always positive
+                side = pos.get('side', '').lower()
+                if side not in ('long', 'short'):
+                    # Fallback: check positionAmt from raw info
+                    raw_amt = float(pos.get('info', {}).get('positionAmt', 0) or 0)
+                    side = 'long' if raw_amt > 0 else 'short' if raw_amt < 0 else 'long'
+
                 return {
                     'symbol': pos['symbol'],
-                    'side': 'long' if contracts > 0 else 'short',
+                    'side': side,
                     'contracts': abs(contracts),
                     'entry_price': float(pos.get('entryPrice', 0) or 0),
                     'unrealized_pnl': float(pos.get('unrealizedPnl', 0) or 0),
@@ -563,6 +571,10 @@ def place_emergency_sl_tp(position):
         return
 
     contracts = current_pos['contracts']
+    side = current_pos['side']  # Use re-verified side
+    entry = current_pos['entry_price'] if current_pos['entry_price'] > 0 else entry
+
+    print(f"   📋 Emergency SL/TP for {side.upper()} position: {contracts} contracts @ ${entry:,.2f}", flush=True)
 
     if side == 'long':
         sl = round_price(entry * 0.97, symbol)
@@ -575,17 +587,24 @@ def place_emergency_sl_tp(position):
 
     # Place amount-based SL/TP
     try:
-        trading_exchange.create_order(
+        print(f"   📋 Placing emergency orders: side={order_side} contracts={contracts} SL=${sl:,.2f} TP=${tp:,.2f}", flush=True)
+
+        sl_order = trading_exchange.create_order(
             symbol, 'STOP_MARKET', order_side, contracts,
             None, {'stopPrice': sl}
         )
-        trading_exchange.create_order(
+        print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')}", flush=True)
+
+        tp_order = trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', order_side, contracts,
             None, {'stopPrice': tp}
         )
+        print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')}", flush=True)
+
         print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
     except Exception as e:
         print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
+        print(f"   ❌ Details: symbol={symbol} side={order_side} contracts={contracts} sl={sl} tp={tp}", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -1190,17 +1209,19 @@ async def execute_trade(decision, balance):
 
         # Place stop loss (amount-based — closePosition unreliable on demo)
         sl_side = "sell" if action == "long" else "buy"
-        trading_exchange.create_order(
+        sl_order = trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
             None, {'stopPrice': sl}
         )
+        print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')} ({sl_side} @ ${sl:,.2f})", flush=True)
 
         # Place take profit (amount-based)
         tp_side = "sell" if action == "long" else "buy"
-        trading_exchange.create_order(
+        tp_order = trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
             None, {'stopPrice': tp}
         )
+        print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
 
         # Log the trade
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
@@ -1219,6 +1240,20 @@ async def execute_trade(decision, balance):
         print(f"   📐 Notional: ${actual_notional:,.0f} | Margin: ${actual_margin:,.0f} | Risk: ${actual_risk:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
         print(f"   🛑 SL: ${sl:,.2f} (-{sl_dist_pct:.1f}%) | 🎯 TP: ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
+
+        # Verify orders were placed
+        await asyncio.sleep(2)
+        has_sl, has_tp, _ = has_sl_tp_orders(symbol)
+        if not has_sl or not has_tp:
+            print(f"   ⚠️ Post-trade verification: SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'}", flush=True)
+            if not has_sl and not has_tp:
+                print(f"   🚨 Both orders missing — re-placing...", flush=True)
+                pos = get_open_position()
+                if pos:
+                    place_emergency_sl_tp(pos)
+        else:
+            print(f"   ✅ SL/TP verified on exchange", flush=True)
+
         return True
 
     except Exception as e:
@@ -1372,6 +1407,7 @@ async def main_loop():
                 print(f"\n[{now}] 📍 OPEN: {position['side'].upper()} {position['symbol']} | "
                       f"Entry ${position['entry_price']:,.2f} | {position['leverage']}x | "
                       f"Notional ${position['notional']:,.0f} | "
+                      f"Contracts: {position['contracts']} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
 
                 # Verify SL/TP orders still exist
