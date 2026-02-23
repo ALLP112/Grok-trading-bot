@@ -79,10 +79,46 @@ def get_cached_markets():
     global _markets_cache, _markets_cache_time
     now = time.time()
     if _markets_cache is None or (now - _markets_cache_time) > MARKETS_CACHE_TTL:
-        _markets_cache = public_exchange.load_markets()
-        trading_exchange.load_markets()
-        _markets_cache_time = now
-        print(f"   🔄 Markets refreshed ({len(_markets_cache)} loaded)", flush=True)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                _markets_cache = public_exchange.load_markets()
+                trading_exchange.load_markets()
+                _markets_cache_time = time.time()
+                print(f"   🔄 Markets refreshed ({len(_markets_cache)} loaded)", flush=True)
+                return _markets_cache
+            except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+                # Parse ban duration if available
+                ban_msg = str(e)
+                wait = min(300, 60 * attempt)  # Cap at 5 min
+
+                # Check for "banned until" timestamp in error message
+                if 'banned until' in ban_msg:
+                    try:
+                        ban_ts = int(''.join(c for c in ban_msg.split('banned until')[1].split('.')[0].strip() if c.isdigit()))
+                        ban_remaining = max(0, (ban_ts / 1000) - time.time())
+                        if ban_remaining > 0:
+                            wait = min(ban_remaining + 30, 600)  # Wait until ban lifts + 30s buffer, max 10 min
+                    except Exception:
+                        pass
+
+                print(f"   ⚠️ Binance rate limit/ban (attempt {attempt}): {ban_msg[:100]}", flush=True)
+                print(f"   ⏳ Waiting {wait:.0f}s before retry...", flush=True)
+                time.sleep(wait)
+
+                # If we have a stale cache, use it rather than blocking forever
+                if _markets_cache is not None and attempt >= 3:
+                    print(f"   ⚠️ Using stale market cache", flush=True)
+                    return _markets_cache
+            except Exception as e:
+                print(f"   ❌ Markets load error: {e}", flush=True)
+                if _markets_cache is not None:
+                    return _markets_cache
+                time.sleep(30)
+                if attempt >= 10:
+                    print(f"   ❌ Failed to load markets after {attempt} attempts", flush=True)
+                    return _markets_cache  # Will be None on first run
     return _markets_cache
 
 
@@ -673,9 +709,20 @@ def calculate_position_size(balance, entry_price, sl_price, leverage):
 
 async def get_top_candidates(n=100):
     get_cached_markets()
-    async def _fetch():
-        return public_exchange.fetch_tickers()
-    tickers = await retry_async(_fetch, label="fetch_tickers")
+    tickers = None
+    for attempt in range(3):
+        try:
+            tickers = public_exchange.fetch_tickers()
+            break
+        except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+            wait = 60 * (attempt + 1)
+            print(f"   ⚠️ Rate limited fetching tickers (attempt {attempt + 1}/3) — waiting {wait}s", flush=True)
+            await asyncio.sleep(wait)
+        except Exception:
+            raise
+    if not tickers:
+        print(f"   ❌ Could not fetch tickers — skipping scan", flush=True)
+        return []
     markets = public_exchange.markets or {}
     candidates = []
     for symbol, ticker in tickers.items():
@@ -694,10 +741,16 @@ async def get_top_candidates(n=100):
     return candidates[:n]
 
 
-async def deep_enrich(candidates, top_n=15):
+async def deep_enrich(candidates, top_n=10):
+    """
+    Tiered enrichment to stay within rate limits:
+    - Top 5: Full (funding + 15m + 1h + 4h + OI + L/S + order book) ~7 calls each
+    - 6-10: Partial (funding + 15m + 1h) ~3 calls each
+    Total: ~50 calls with 0.3s gaps = ~15 seconds
+    """
     enriched = []
 
-    # === MARKET CONTEXT: BTC + ETH as tide indicators ===
+    # === MARKET CONTEXT: BTC + ETH ===
     market_context = {}
     try:
         btc_candles = public_exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=24)
@@ -711,7 +764,7 @@ async def deep_enrich(candidates, top_n=15):
             btc_ta = analyze_candles(btc_candles)
             market_context['btc_rsi'] = btc_ta['rsi'] if btc_ta else 50
             market_context['btc_ema_trend'] = btc_ta['ema_trend'] if btc_ta else 'mixed'
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
 
         eth_candles = public_exchange.fetch_ohlcv('ETH/USDT:USDT', '1h', limit=24)
         if eth_candles and len(eth_candles) >= 2:
@@ -719,84 +772,108 @@ async def deep_enrich(candidates, top_n=15):
             eth_24h_ago = eth_candles[0][1]
             market_context['eth_price'] = eth_now
             market_context['eth_24h_pct'] = (eth_now - eth_24h_ago) / eth_24h_ago * 100
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)
     except Exception as e:
         print(f"   ⚠️ Market context fetch error: {e}", flush=True)
 
     for i, c in enumerate(candidates[:top_n]):
         symbol = c['symbol']
+        is_top5 = i < 5
+
         try:
-            # Funding rate
+            # Funding rate (all coins)
             funding = public_exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
             c['funding'] = funding
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)
 
-            # 15-minute candles
+            # 15-minute candles (all coins)
             candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
             c['ta_15m'] = analyze_candles(candles_15m)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)
 
-            # 1-hour candles
+            # 1-hour candles (all coins)
             candles_1h = public_exchange.fetch_ohlcv(symbol, '1h', limit=50)
             c['ta_1h'] = analyze_candles(candles_1h)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)
 
-            # 4-hour candles (higher timeframe)
-            candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=30)
-            c['ta_4h'] = analyze_candles(candles_4h)
-            await asyncio.sleep(0.15)
+            # --- TOP 5 ONLY: deeper analysis ---
+            if is_top5:
+                # 4h candles
+                candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=30)
+                c['ta_4h'] = analyze_candles(candles_4h)
+                await asyncio.sleep(0.3)
 
-            # Open Interest
-            try:
-                raw_symbol = symbol_to_binance_raw(symbol)
-                oi_data = public_exchange.fapipublic_get_openinterest({'symbol': raw_symbol})
-                c['open_interest'] = float(oi_data.get('openInterest', 0))
-                c['oi_notional'] = c['open_interest'] * c['price']
-            except Exception:
-                c['open_interest'] = 0
-                c['oi_notional'] = 0
-            await asyncio.sleep(0.15)
+                # Open Interest
+                try:
+                    raw_symbol = symbol_to_binance_raw(symbol)
+                    oi_data = public_exchange.fapipublic_get_openinterest({'symbol': raw_symbol})
+                    c['open_interest'] = float(oi_data.get('openInterest', 0))
+                    c['oi_notional'] = c['open_interest'] * c['price']
+                except Exception:
+                    c['open_interest'] = 0
+                    c['oi_notional'] = 0
+                await asyncio.sleep(0.3)
 
-            # Long/Short Ratio (top traders)
-            try:
-                ls_data = public_exchange.fapipublic_get_toplongshortaccountratio({
-                    'symbol': raw_symbol,
-                    'period': '1h',
-                    'limit': 5,
-                })
-                if ls_data and len(ls_data) > 0:
-                    latest_ls = ls_data[-1]
-                    c['long_short_ratio'] = float(latest_ls.get('longShortRatio', 1.0))
-                    c['long_pct'] = float(latest_ls.get('longAccount', 0.5)) * 100
-                    c['short_pct'] = float(latest_ls.get('shortAccount', 0.5)) * 100
-                    # Trend: compare latest to 5h ago
-                    if len(ls_data) >= 5:
-                        old_ls = float(ls_data[0].get('longShortRatio', 1.0))
-                        new_ls = float(ls_data[-1].get('longShortRatio', 1.0))
-                        c['ls_trend'] = 'longs_increasing' if new_ls > old_ls * 1.05 else (
-                            'shorts_increasing' if new_ls < old_ls * 0.95 else 'stable')
+                # Long/Short Ratio
+                try:
+                    ls_data = public_exchange.fapipublic_get_toplongshortaccountratio({
+                        'symbol': raw_symbol,
+                        'period': '1h',
+                        'limit': 5,
+                    })
+                    if ls_data and len(ls_data) > 0:
+                        latest_ls = ls_data[-1]
+                        c['long_short_ratio'] = float(latest_ls.get('longShortRatio', 1.0))
+                        c['long_pct'] = float(latest_ls.get('longAccount', 0.5)) * 100
+                        c['short_pct'] = float(latest_ls.get('shortAccount', 0.5)) * 100
+                        if len(ls_data) >= 5:
+                            old_ls = float(ls_data[0].get('longShortRatio', 1.0))
+                            new_ls = float(ls_data[-1].get('longShortRatio', 1.0))
+                            c['ls_trend'] = 'longs_increasing' if new_ls > old_ls * 1.05 else (
+                                'shorts_increasing' if new_ls < old_ls * 0.95 else 'stable')
+                        else:
+                            c['ls_trend'] = 'stable'
                     else:
+                        c['long_short_ratio'] = 1.0
+                        c['long_pct'] = 50
+                        c['short_pct'] = 50
                         c['ls_trend'] = 'stable'
-                else:
+                except Exception:
                     c['long_short_ratio'] = 1.0
                     c['long_pct'] = 50
                     c['short_pct'] = 50
                     c['ls_trend'] = 'stable'
-            except Exception:
+                await asyncio.sleep(0.3)
+
+                # Order book
+                ob = public_exchange.fetch_order_book(symbol, limit=20)
+                c['order_book'] = analyze_order_book(ob)
+                await asyncio.sleep(0.3)
+            else:
+                # Partial enrichment for coins 6-10
+                c['ta_4h'] = None
+                c['open_interest'] = 0
+                c['oi_notional'] = 0
                 c['long_short_ratio'] = 1.0
                 c['long_pct'] = 50
                 c['short_pct'] = 50
-                c['ls_trend'] = 'stable'
-            await asyncio.sleep(0.15)
-
-            # Order book (top 5 only)
-            if i < 5:
-                ob = public_exchange.fetch_order_book(symbol, limit=20)
-                c['order_book'] = analyze_order_book(ob)
-                await asyncio.sleep(0.15)
-            else:
+                c['ls_trend'] = 'n/a'
                 c['order_book'] = None
 
+        except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+            print(f"   ⚠️ Rate limited during enrichment — pausing 30s: {e}", flush=True)
+            await asyncio.sleep(30)
+            c['funding'] = c.get('funding', 0.0)
+            c['ta_15m'] = c.get('ta_15m')
+            c['ta_1h'] = c.get('ta_1h')
+            c['ta_4h'] = None
+            c['open_interest'] = 0
+            c['oi_notional'] = 0
+            c['long_short_ratio'] = 1.0
+            c['long_pct'] = 50
+            c['short_pct'] = 50
+            c['ls_trend'] = 'n/a'
+            c['order_book'] = None
         except Exception as e:
             print(f"   ⚠️ Enrich error on {symbol}: {e}", flush=True)
             c['funding'] = c.get('funding', 0.0)
@@ -808,11 +885,10 @@ async def deep_enrich(candidates, top_n=15):
             c['long_short_ratio'] = 1.0
             c['long_pct'] = 50
             c['short_pct'] = 50
-            c['ls_trend'] = 'stable'
+            c['ls_trend'] = 'n/a'
             c['order_book'] = None
         enriched.append(c)
 
-    # Attach market context to each candidate
     for c in enriched:
         c['market_context'] = market_context
 
@@ -1155,27 +1231,36 @@ async def execute_trade(decision, balance):
 # ============================================================
 
 async def scan_and_trade():
-    candidates = await get_top_candidates(100)
-    print(f"   📈 Found {len(candidates)} futures", flush=True)
+    try:
+        candidates = await get_top_candidates(100)
+        print(f"   📈 Found {len(candidates)} futures", flush=True)
 
-    print(f"   🔬 Enriching top 15 with technicals + order book...", flush=True)
-    enriched = await deep_enrich(candidates, 15)
+        if not candidates:
+            print(f"   ⚠️ No candidates available — skipping this cycle", flush=True)
+            return False
 
-    balance_data = trading_exchange.fetch_balance()
-    balance = float(balance_data['total'].get('USDT', 0))
-    print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
+        print(f"   🔬 Enriching top 10 with technicals + order book...", flush=True)
+        enriched = await deep_enrich(candidates, 10)
 
-    if session_start_balance and session_start_balance > 0:
-        session_pnl = balance - session_start_balance
-        print(f"   📊 Session PnL: ${session_pnl:+,.2f} ({session_pnl / session_start_balance * 100:+.2f}%)", flush=True)
+        balance_data = trading_exchange.fetch_balance()
+        balance = float(balance_data['total'].get('USDT', 0))
+        print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
 
-    decision = await grok_decision(enriched, balance)
-    print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
-          f"{decision.get('action', 'hold')} "
-          f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
+        if session_start_balance and session_start_balance > 0:
+            session_pnl = balance - session_start_balance
+            print(f"   📊 Session PnL: ${session_pnl:+,.2f} ({session_pnl / session_start_balance * 100:+.2f}%)", flush=True)
 
-    opened = await execute_trade(decision, balance)
-    return opened
+        decision = await grok_decision(enriched, balance)
+        print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
+              f"{decision.get('action', 'hold')} "
+              f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
+
+        opened = await execute_trade(decision, balance)
+        return opened
+
+    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+        print(f"   🚫 Rate limited during scan — skipping this cycle: {str(e)[:80]}", flush=True)
+        return False
 
 
 # ============================================================
@@ -1222,17 +1307,35 @@ async def main_loop():
     print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, multi-timeframe", flush=True)
     print("=" * 60, flush=True)
 
-    try:
-        bal = trading_exchange.fetch_balance()
-        session_start_balance = float(bal['total'].get('USDT', 0))
-        print(f"💰 Session starting balance: ${session_start_balance:,.2f}", flush=True)
-        print(f"💵 Risk budget per trade: ${session_start_balance * MAX_RISK_PERCENT / 100:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
-        print(f"🏦 Max margin per trade: ${session_start_balance * MAX_MARGIN_PERCENT / 100:,.2f} ({MAX_MARGIN_PERCENT}%)", flush=True)
-    except Exception:
-        session_start_balance = 0
+    # Balance fetch with retry
+    for _ in range(10):
+        try:
+            bal = trading_exchange.fetch_balance()
+            session_start_balance = float(bal['total'].get('USDT', 0))
+            print(f"💰 Session starting balance: ${session_start_balance:,.2f}", flush=True)
+            print(f"💵 Risk budget per trade: ${session_start_balance * MAX_RISK_PERCENT / 100:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
+            print(f"🏦 Max margin per trade: ${session_start_balance * MAX_MARGIN_PERCENT / 100:,.2f} ({MAX_MARGIN_PERCENT}%)", flush=True)
+            break
+        except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+            print(f"   ⚠️ Rate limited fetching balance — waiting 60s: {str(e)[:80]}", flush=True)
+            await asyncio.sleep(60)
+        except Exception:
+            session_start_balance = 0
+            break
 
     get_cached_markets()
-    cleanup_all_orders()
+
+    # Cleanup with retry
+    for _ in range(3):
+        try:
+            cleanup_all_orders()
+            break
+        except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable):
+            print(f"   ⚠️ Rate limited during cleanup — waiting 60s", flush=True)
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"   ⚠️ Cleanup error: {e}", flush=True)
+            break
 
     # Check for orphaned position on startup
     position = get_open_position()
@@ -1248,7 +1351,11 @@ async def main_loop():
         last_position_symbol = position['symbol']
         had_position_last_cycle = True
 
-    print_income_summary()
+    try:
+        print_income_summary()
+    except Exception:
+        pass
+
     cycle_count = 0
 
     while True:
@@ -1267,7 +1374,7 @@ async def main_loop():
                       f"Notional ${position['notional']:,.0f} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
 
-                # Verify SL/TP orders still exist — re-place if missing
+                # Verify SL/TP orders still exist
                 has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
                 if not has_sl or not has_tp:
                     print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
@@ -1305,6 +1412,24 @@ async def main_loop():
             if cycle_count % 10 == 0:
                 print_pnl_dashboard()
                 print_income_summary()
+
+        except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+            ban_msg = str(e)
+            wait = 120  # Default 2 min
+
+            if 'banned until' in ban_msg:
+                try:
+                    ban_ts = int(''.join(c for c in ban_msg.split('banned until')[1].split('.')[0].strip() if c.isdigit()))
+                    ban_remaining = max(0, (ban_ts / 1000) - time.time())
+                    if ban_remaining > 0:
+                        wait = min(ban_remaining + 30, 600)
+                except Exception:
+                    pass
+
+            print(f"   🚫 Binance rate limit/ban in main loop: {ban_msg[:100]}", flush=True)
+            print(f"   ⏳ Sleeping {wait:.0f}s before resuming...", flush=True)
+            await asyncio.sleep(wait)
+            continue  # Skip the normal sleep, retry immediately
 
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
