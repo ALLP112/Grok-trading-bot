@@ -1,6 +1,7 @@
 """
-HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Aggressive Isolated Margin)
-Scans top 100 coins, only one position open at once, closes current before new
+HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
+Scans top 100 coins, strictly one position at a time
+Position closes only when its own SL/TP is hit — never overridden by new signals
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -14,7 +15,7 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
-print("Grok 4.1 Thinking + Aggressive High-Leverage First-Principles mode active", flush=True)
+print("Grok 4.1 Thinking + Cross Margin + Single Position mode", flush=True)
 
 load_dotenv()
 
@@ -23,13 +24,16 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
-MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))  # Higher risk for aggressive high-leverage style
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 
 # === CHECK KEYS ===
 missing = []
-if not XAI_API_KEY: missing.append("XAI_API_KEY")
-if not BINANCE_API_KEY: missing.append("BINANCE_API_KEY")
-if not BINANCE_API_SECRET: missing.append("BINANCE_API_SECRET")
+if not XAI_API_KEY:
+    missing.append("XAI_API_KEY")
+if not BINANCE_API_KEY:
+    missing.append("BINANCE_API_KEY")
+if not BINANCE_API_SECRET:
+    missing.append("BINANCE_API_SECRET")
 if missing:
     print(f"❌ FATAL: Missing: {', '.join(missing)}", flush=True)
     sys.exit(1)
@@ -43,137 +47,276 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 exchange.enable_demo_trading(True)
-print("✅ Connected to Binance DEMO futures", flush=True)
+print("✅ Connected to Binance DEMO futures (cross margin)", flush=True)
 
-async def close_current_position():
-    """Closes the current position (if any) before opening a new one"""
+
+# ============================================================
+#  POSITION TRACKING
+# ============================================================
+
+def get_open_position():
+    """Returns the single open position dict, or None if flat."""
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
-            if float(pos['contracts']) != 0:
-                symbol = pos['symbol']
-                side = 'sell' if float(pos['contracts']) > 0 else 'buy'
-                amount = abs(float(pos['contracts']))
-                exchange.create_market_order(symbol, side, amount)
-                print(f"   🔄 Closed current position: {symbol}", flush=True)
-        await asyncio.sleep(2)  # Allow Binance to update margin
+            contracts = float(pos.get('contracts', 0))
+            if contracts != 0:
+                return {
+                    'symbol': pos['symbol'],
+                    'side': 'long' if contracts > 0 else 'short',
+                    'contracts': abs(contracts),
+                    'entry_price': float(pos.get('entryPrice', 0)),
+                    'unrealized_pnl': float(pos.get('unrealizedPnl', 0)),
+                    'leverage': int(pos.get('leverage', 1)),
+                    'notional': abs(float(pos.get('notional', 0))),
+                }
+        return None
     except Exception as e:
-        print(f"   ⚠️ Error closing current position: {e}", flush=True)
+        print(f"   ⚠️ Error fetching positions: {e}", flush=True)
+        return None
 
-async def get_top_candidates(n=25):
+
+def cancel_open_orders(symbol):
+    """Cancel all open orders for a symbol (cleanup after SL/TP hit)."""
+    try:
+        open_orders = exchange.fetch_open_orders(symbol)
+        for order in open_orders:
+            exchange.cancel_order(order['id'], symbol)
+        if open_orders:
+            print(f"   🧹 Cancelled {len(open_orders)} leftover orders on {symbol}", flush=True)
+    except Exception as e:
+        print(f"   ⚠️ Error cancelling orders: {e}", flush=True)
+
+
+# ============================================================
+#  MARKET SCANNING
+# ============================================================
+
+async def get_top_candidates(n=100):
+    """Fetch top N futures coins by 24h volume."""
     markets = exchange.load_markets()
     tickers = exchange.fetch_tickers()
     candidates = []
+
     for symbol, ticker in tickers.items():
         market = markets.get(symbol, {})
-        if (symbol.endswith('USDT') and
-            market.get('swap', False) and
-            market.get('contractType') == 'PERPETUAL' and
-            market.get('active', False)):
-            
-            try:
-                funding = exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
-            except:
-                funding = 0.0
+        if (symbol.endswith('USDT')
+                and market.get('swap', False)
+                and market.get('contractType') == 'PERPETUAL'
+                and market.get('active', False)):
             vol = ticker.get('quoteVolume') or 0
             candidates.append({
                 'symbol': symbol,
-                'price': ticker['last'],
+                'price': ticker.get('last', 0),
                 'change24h': ticker.get('percentage', 0),
                 'volume': vol,
-                'funding': funding
             })
+
     candidates.sort(key=lambda x: x['volume'], reverse=True)
     return candidates[:n]
 
-async def grok_decision(candidates):
-    data_str = "\n".join([f"{c['symbol']}: Price ${c['price']:,.2f}, 24h {c['change24h']:.2f}%, Funding {c['funding']*100:.4f}%, Vol ${c['volume']/1e9:.1f}B" for c in candidates])
 
-    prompt = f"""You are **AlphaEdge High-Leverage**, an aggressive first-principles trader specializing in high-leverage (10-20x) isolated margin plays on Binance futures.
+async def enrich_top_picks(candidates, top_n=25):
+    """Fetch funding rates for the top N candidates (API-intensive, so limit)."""
+    enriched = []
+    for c in candidates[:top_n]:
+        try:
+            funding = exchange.fetch_funding_rate(c['symbol']).get('fundingRate', 0.0)
+        except Exception:
+            funding = 0.0
+        c['funding'] = funding
+        enriched.append(c)
+    return enriched
 
-You actively seek strong, fast-moving imbalances that justify high leverage and significant risk when the edge is clear.
 
-Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")}
-Timeframe: next {INTERVAL_MINUTES} minutes
-Top 25 candidates by volume:
+# ============================================================
+#  GROK AI DECISION
+# ============================================================
+
+async def grok_decision(candidates, balance):
+    data_str = "\n".join([
+        f"{c['symbol']}: ${c['price']:,.2f}, 24h {c['change24h']:+.2f}%, "
+        f"Funding {c.get('funding', 0) * 100:.4f}%, Vol ${c['volume'] / 1e9:.1f}B"
+        for c in candidates
+    ])
+
+    prompt = f"""You are **AlphaEdge**, an aggressive first-principles futures trader.
+You use CROSS margin and high leverage (10-20x) when conviction is high.
+
+Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")}
+Available balance: {balance:.2f} USDT
+Scan interval: every {INTERVAL_MINUTES} minutes
+Max risk per trade: {MAX_RISK_PERCENT}% of balance
+
+Top 25 futures coins by volume (from a top-100 scan):
 {data_str}
 
-Perform deep first-principles analysis and pick the **single best** high-leverage long or short setup (or hold if no strong edge).
+RULES:
+- Pick the SINGLE BEST setup, or hold if nothing is strong enough.
+- You MUST set a stop_loss and take_profit — the position will close ONLY when one of these is hit.
+- Use cross margin. Leverage 10-20x when confident.
+- size_usdt must not exceed {MAX_RISK_PERCENT}% of balance ({balance * MAX_RISK_PERCENT / 100:.2f} USDT).
+- Only trade if confidence >= 0.74.
 
 Return ONLY valid JSON:
 {{
   "symbol": "e.g. SOLUSDT",
-  "action": "long" | "short" | "close" | "hold",
+  "action": "long" | "short" | "hold",
   "leverage": integer 1-20,
-  "size_usdt": number (respect {MAX_RISK_PERCENT}% risk),
-  "stop_loss": number,
-  "take_profit": number or null,
+  "size_usdt": number,
+  "stop_loss": number (required — price level),
+  "take_profit": number (required — price level),
   "confidence": 0.00-1.00,
-  "reason": "concise 1-2 sentence explanation of the high-leverage edge"
-}}
-
-Only take the trade if confidence >= 0.74. Use high leverage (12-20x) when conviction is high. Use isolated margin only."""
+  "reason": "1-2 sentence explanation"
+}}"""
 
     response = await client.chat.completions.create(
         model="grok-4-1-fast-reasoning",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.75,
-        max_tokens=1100
+        temperature=0.7,
+        max_tokens=1000
     )
-    
+
     try:
         text = response.choices[0].message.content.strip()
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         return json.loads(text)
-    except:
+    except Exception:
         return {"action": "hold", "confidence": 0}
 
-async def execute(decision):
-    if decision["action"] == "hold" or decision.get("confidence", 0) < 0.65:
-        print(f" ⏸️ HOLD — best candidate was {decision.get('symbol', 'none')} (confidence {decision.get('confidence', 0):.2f})", flush=True)
+
+# ============================================================
+#  TRADE EXECUTION
+# ============================================================
+
+async def execute_trade(decision, balance):
+    action = decision.get("action", "hold")
+    confidence = decision.get("confidence", 0)
+    symbol = decision.get("symbol")
+    sl = decision.get("stop_loss")
+    tp = decision.get("take_profit")
+
+    if action == "hold" or confidence < 0.74:
+        print(f"   ⏸️  HOLD — confidence {confidence:.2f} | {decision.get('reason', 'n/a')}", flush=True)
         return
 
-    symbol = decision.get("symbol")
-    if not symbol:
+    if not symbol or not sl or not tp:
+        print(f"   ⚠️ Missing symbol/SL/TP in Grok response — skipping", flush=True)
         return
 
     try:
-        # Always close current position before opening a new one (strict single position)
-        await close_current_position()
+        # --- Set cross margin and leverage ---
+        try:
+            exchange.set_margin_mode('cross', symbol)
+        except Exception:
+            pass  # Already set to cross — Binance throws error if unchanged
 
-        # Fetch fresh price
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
-
-        # Set isolated margin
-        exchange.set_margin_mode('isolated', symbol)
-
-        leverage = min(decision.get("leverage", 15), 20)
+        leverage = min(decision.get("leverage", 10), 20)
         exchange.set_leverage(leverage, symbol)
 
-        side = "buy" if decision["action"] == "long" else "sell"
-        amount = decision["size_usdt"] / current_price
-        exchange.create_market_order(symbol, side, amount)
+        # --- Calculate position size ---
+        max_size = balance * MAX_RISK_PERCENT / 100
+        size_usdt = min(decision.get("size_usdt", max_size), max_size)
 
-        print(f" 🔥 EXECUTED {decision['action'].upper()} {symbol} | Size ${decision['size_usdt']:.0f} | Leverage {leverage}x @ ${current_price:,.2f} (Isolated)", flush=True)
-        print(f" 💡 Reason: {decision.get('reason', 'n/a')}", flush=True)
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        amount = size_usdt / current_price
+
+        # --- Place entry order ---
+        entry_side = "buy" if action == "long" else "sell"
+        exchange.create_market_order(symbol, entry_side, amount)
+
+        # --- Place stop loss (closes position when hit) ---
+        sl_side = "sell" if action == "long" else "buy"
+        exchange.create_order(
+            symbol, 'STOP_MARKET', sl_side, amount,
+            None,  # no limit price for stop market
+            {'stopPrice': sl, 'closePosition': True}
+        )
+
+        # --- Place take profit (closes position when hit) ---
+        tp_side = "sell" if action == "long" else "buy"
+        exchange.create_order(
+            symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
+            None,
+            {'stopPrice': tp, 'closePosition': True}
+        )
+
+        print(f"   🔥 OPENED {action.upper()} {symbol} | ${size_usdt:,.0f} | {leverage}x Cross @ ${current_price:,.2f}", flush=True)
+        print(f"   🛑 SL: ${sl:,.2f} | 🎯 TP: ${tp:,.2f}", flush=True)
+        print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
     except Exception as e:
-        print(f" ❌ Execution error on {symbol}: {e}", flush=True)
+        print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
+
+
+# ============================================================
+#  MAIN LOOP
+# ============================================================
+
+# Track the last symbol we had a position in (for order cleanup)
+last_position_symbol = None
 
 async def main_loop():
-    print("🚀 High Leverage Top100 Scanner (Grok 4.1 Thinking + Isolated Margin) is now RUNNING on DEMO", flush=True)
+    global last_position_symbol
+
+    print("🚀 High Leverage Top100 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
+    print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Max risk: {MAX_RISK_PERCENT}%", flush=True)
+    print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
+    print("=" * 60, flush=True)
+
     while True:
         try:
-            candidates = await get_top_candidates(25)
-            print(f"\n[{datetime.now(UTC).strftime('%H:%M:%S')}] Scanning top 25 for high-leverage edge...", flush=True)
-            decision = await grok_decision(candidates)
-            print(f" 🤖 Grok picks: {decision.get('symbol')} {decision.get('action')} (confidence: {decision.get('confidence', 0):.2f})", flush=True)
-            await execute(decision)
+            now = datetime.now(UTC).strftime('%H:%M:%S')
+
+            # --- Check for existing position ---
+            position = get_open_position()
+
+            if position:
+                # Position is open — just monitor, do NOT scan for new trades
+                last_position_symbol = position['symbol']
+                pnl = position['unrealized_pnl']
+                pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
+                print(f"\n[{now}] 📍 OPEN: {position['side'].upper()} {position['symbol']} | "
+                      f"Entry ${position['entry_price']:,.2f} | {position['leverage']}x | "
+                      f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
+                print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
+
+            else:
+                # No position — clean up leftover orders from last trade, then scan
+                if last_position_symbol:
+                    cancel_open_orders(last_position_symbol)
+                    last_position_symbol = None
+
+                print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
+
+                # Scan markets
+                candidates = await get_top_candidates(100)
+                print(f"   📈 Found {len(candidates)} perpetual futures", flush=True)
+
+                # Enrich top 25 with funding rates
+                enriched = await enrich_top_picks(candidates, 25)
+
+                # Get balance
+                balance_data = exchange.fetch_balance()
+                balance = float(balance_data['total'].get('USDT', 0))
+                print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
+
+                # Ask Grok
+                decision = await grok_decision(enriched, balance)
+                print(f"   🤖 Grok picks: {decision.get('symbol', 'none')} "
+                      f"{decision.get('action', 'hold')} "
+                      f"(confidence: {decision.get('confidence', 0):.2f})", flush=True)
+
+                # Execute if confident
+                await execute_trade(decision, balance)
+
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
+
         await asyncio.sleep(INTERVAL_MINUTES * 60)
+
 
 print("Starting main loop...", flush=True)
 asyncio.run(main_loop())
