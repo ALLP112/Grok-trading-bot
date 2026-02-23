@@ -516,6 +516,18 @@ def place_emergency_sl_tp(position):
     if entry <= 0:
         print(f"   ⚠️ Cannot place emergency SL/TP — entry price unknown", flush=True)
         return
+
+    # Wait for Binance to fully register the position
+    time.sleep(3)
+
+    # Re-verify position still exists
+    current_pos = get_open_position()
+    if not current_pos or current_pos['symbol'] != symbol:
+        print(f"   ⚠️ Position no longer exists — skipping emergency SL/TP", flush=True)
+        return
+
+    contracts = current_pos['contracts']
+
     if side == 'long':
         sl = round_price(entry * 0.97, symbol)
         tp = round_price(entry * 1.045, symbol)
@@ -524,18 +536,36 @@ def place_emergency_sl_tp(position):
         sl = round_price(entry * 1.03, symbol)
         tp = round_price(entry * 0.955, symbol)
         order_side = 'buy'
-    try:
-        trading_exchange.create_order(
-            symbol, 'STOP_MARKET', order_side, position['contracts'],
-            None, {'stopPrice': sl, 'closePosition': True}
-        )
-        trading_exchange.create_order(
-            symbol, 'TAKE_PROFIT_MARKET', order_side, position['contracts'],
-            None, {'stopPrice': tp, 'closePosition': True}
-        )
-        print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
-    except Exception as e:
-        print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
+
+    # Try closePosition first, fall back to amount-based
+    for use_close_pos in [True, False]:
+        try:
+            params_sl = {'stopPrice': sl}
+            params_tp = {'stopPrice': tp}
+            amount = contracts
+
+            if use_close_pos:
+                params_sl['closePosition'] = True
+                params_tp['closePosition'] = True
+
+            trading_exchange.create_order(
+                symbol, 'STOP_MARKET', order_side, amount,
+                None, params_sl
+            )
+            trading_exchange.create_order(
+                symbol, 'TAKE_PROFIT_MARKET', order_side, amount,
+                None, params_tp
+            )
+            print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}"
+                  f"{'' if use_close_pos else ' (amount-based)'}", flush=True)
+            return
+        except Exception as e:
+            if use_close_pos and ('-4509' in str(e) or 'GTE' in str(e)):
+                print(f"   ⚠️ closePosition rejected — retrying with amount-based orders...", flush=True)
+                continue
+            else:
+                print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
+                return
 
 
 def cancel_all_open_orders(symbol):
@@ -1073,7 +1103,15 @@ async def main_loop():
                       f"Entry ${position['entry_price']:,.2f} | {position['leverage']}x | "
                       f"Notional ${position['notional']:,.0f} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
-                print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
+
+                # Verify SL/TP orders still exist — re-place if missing
+                has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
+                if not has_sl or not has_tp:
+                    print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
+                    cancel_all_open_orders(position['symbol'])
+                    place_emergency_sl_tp(position)
+                else:
+                    print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
