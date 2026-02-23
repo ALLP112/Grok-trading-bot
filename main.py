@@ -1,6 +1,7 @@
 """
 HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
 Enhanced with technical indicators, multi-timeframe analysis, order book data
+Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 100 coins, strictly one position at a time
 Binance Demo Trading — runs 24/7 on Render.com
 """
@@ -18,7 +19,7 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
-print("Grok 4.1 Thinking + Enhanced Technical Analysis + Cross Margin", flush=True)
+print("Grok 4.1 Thinking + Risk-Based Sizing + Cross Margin", flush=True)
 
 load_dotenv()
 
@@ -28,6 +29,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
+MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 
 # === CHECK KEYS ===
 missing = []
@@ -143,18 +145,9 @@ def round_price(price, symbol):
 # ============================================================
 
 def parse_grok_json(text):
-    """
-    Extract JSON from Grok's response, handling:
-    - ```json ... ``` blocks
-    - Trailing text after JSON
-    - JSON embedded in other text
-    """
     if not text:
         return None
-
     text = text.strip()
-
-    # Try extracting from ```json block
     if "```json" in text:
         match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
         if match:
@@ -162,8 +155,6 @@ def parse_grok_json(text):
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-
-    # Try extracting from any ``` block
     if "```" in text:
         match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
         if match:
@@ -171,16 +162,12 @@ def parse_grok_json(text):
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-
-    # Try finding a JSON object with regex
     match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
-
-    # Last resort: try parsing the whole thing
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -192,7 +179,6 @@ def parse_grok_json(text):
 # ============================================================
 
 async def retry_async(func, retries=2, delay=5, label=""):
-    """Retry an async function on transient errors."""
     last_error = None
     for attempt in range(retries):
         try:
@@ -211,7 +197,6 @@ async def retry_async(func, retries=2, delay=5, label=""):
 
 
 def retry_sync(func, retries=2, delay=5, label=""):
-    """Retry a sync function on transient errors."""
     last_error = None
     for attempt in range(retries):
         try:
@@ -377,11 +362,11 @@ def fetch_trade_history():
         return []
 
 
-def log_trade_open(symbol, action, size_usdt, leverage, entry_price, sl, tp, confidence, reason):
+def log_trade_open(symbol, action, size_usdt, leverage, entry_price, sl, tp, confidence, reason, margin, risk_amount):
     trade = {
         'symbol': symbol, 'action': action, 'size_usdt': size_usdt,
         'leverage': leverage, 'entry_price': entry_price, 'sl': sl, 'tp': tp,
-        'confidence': confidence, 'reason': reason,
+        'confidence': confidence, 'reason': reason, 'margin': margin, 'risk_amount': risk_amount,
         'opened_at': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
         'closed_at': None, 'exit_price': None, 'pnl': None, 'pnl_pct': None, 'result': None,
     }
@@ -437,7 +422,8 @@ def print_pnl_dashboard():
         print(f"   {'-'*50}", flush=True)
         for t in active:
             print(f"   🔄 OPEN: {t['symbol']} {t['action'].upper()} {t['leverage']}x | "
-                  f"Entry ${t['entry_price']:,.2f} | SL ${t['sl']:,.2f} / TP ${t['tp']:,.2f}", flush=True)
+                  f"Entry ${t['entry_price']:,.2f} | SL ${t['sl']:,.2f} / TP ${t['tp']:,.2f} | "
+                  f"Notional ${t['size_usdt']:,.0f} | Margin ${t.get('margin', 0):,.0f}", flush=True)
     print(f"   {'='*50}", flush=True)
 
 
@@ -623,15 +609,55 @@ def validate_sl_tp(action, entry_price, sl, tp):
 
 
 # ============================================================
-#  MARKET SCANNING (with rate limit protection)
+#  RISK-BASED POSITION SIZING
+# ============================================================
+
+def calculate_position_size(balance, entry_price, sl_price, leverage):
+    """
+    Risk-based sizing:
+    - risk_amount = balance × MAX_RISK_PERCENT (the max $ you lose if SL hits)
+    - sl_distance = |entry - SL| / entry (as a fraction)
+    - position_notional = risk_amount / sl_distance
+    - margin_required = position_notional / leverage
+    - Cap margin at MAX_MARGIN_PERCENT of balance
+    
+    Example with balance=$6816, risk=1%, SL=3%, leverage=20x:
+    - risk_amount = $68.16
+    - position_notional = $68.16 / 0.03 = $2,272
+    - margin = $2,272 / 20 = $113.60
+    - If margin > 50% of balance, scale down
+    """
+    risk_amount = balance * MAX_RISK_PERCENT / 100
+    sl_distance = abs(entry_price - sl_price) / entry_price
+
+    if sl_distance < 0.001:
+        sl_distance = 0.01  # Safety floor: 1%
+
+    # Position size from risk budget
+    position_notional = risk_amount / sl_distance
+
+    # Margin required
+    margin_required = position_notional / leverage
+    max_margin = balance * MAX_MARGIN_PERCENT / 100
+
+    # Cap by margin
+    if margin_required > max_margin:
+        margin_required = max_margin
+        position_notional = margin_required * leverage
+        actual_risk = position_notional * sl_distance
+        print(f"   ⚠️ Margin capped at {MAX_MARGIN_PERCENT}% (${max_margin:,.0f}) — risk reduced to ${actual_risk:,.2f}", flush=True)
+
+    return position_notional, margin_required, risk_amount
+
+
+# ============================================================
+#  MARKET SCANNING
 # ============================================================
 
 async def get_top_candidates(n=100):
     get_cached_markets()
-
     async def _fetch():
         return public_exchange.fetch_tickers()
-
     tickers = await retry_async(_fetch, label="fetch_tickers")
     markets = public_exchange.markets or {}
     candidates = []
@@ -658,16 +684,13 @@ async def deep_enrich(candidates, top_n=15):
         try:
             funding = public_exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
             c['funding'] = funding
-            await asyncio.sleep(0.15)  # Rate limit protection
-
+            await asyncio.sleep(0.15)
             candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
             c['ta_15m'] = analyze_candles(candles_15m)
             await asyncio.sleep(0.15)
-
             candles_1h = public_exchange.fetch_ohlcv(symbol, '1h', limit=50)
             c['ta_1h'] = analyze_candles(candles_1h)
             await asyncio.sleep(0.15)
-
             if i < 5:
                 ob = public_exchange.fetch_order_book(symbol, limit=20)
                 c['order_book'] = analyze_order_book(ob)
@@ -715,6 +738,7 @@ async def grok_decision(candidates, balance):
 
     data_str = "".join(lines)
     perf_summary = get_recent_performance_summary()
+    risk_budget = balance * MAX_RISK_PERCENT / 100
 
     prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader using first-principles analysis.
 You combine technical analysis, order flow, and multi-timeframe confluence to find high-leverage edges.
@@ -722,7 +746,11 @@ You combine technical analysis, order flow, and multi-timeframe confluence to fi
 ═══ MARKET CONTEXT ═══
 Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")}
 Available balance: {balance:.2f} USDT
-Max risk per trade: {MAX_RISK_PERCENT}% of balance ({balance * MAX_RISK_PERCENT / 100:.2f} USDT)
+Risk per trade: {MAX_RISK_PERCENT}% = ${risk_budget:.2f} (max loss if SL hits)
+Position sizing: HANDLED AUTOMATICALLY by the system using risk-based math.
+  → You only need to pick the trade, SL, TP, and leverage. The system calculates position size.
+  → Tighter SL = larger position. Wider SL = smaller position. Same risk either way.
+Max margin per trade: {MAX_MARGIN_PERCENT}% of balance (${balance * MAX_MARGIN_PERCENT / 100:.0f})
 Scan interval: every {INTERVAL_MINUTES} minutes
 
 ═══ YOUR RECENT PERFORMANCE ═══
@@ -739,29 +767,28 @@ For each candidate, evaluate:
 4. VOLUME CONFIRMATION: Is volume ratio > 1.5 (above average)? Rising or fading?
 5. ORDER FLOW: Is the book imbalanced in your trade direction? Any walls to watch?
 6. SUPPORT/RESISTANCE: Is entry near S/R? Is there room to TP before next resistance?
-7. RISK/REWARD: SL should be at a technical level (below support/above resistance). TP should be ≥2x the SL distance.
+7. RISK/REWARD: SL at technical level. TP ≥2x the SL distance for good R:R.
 
 ═══ RULES ═══
 - Pick the SINGLE BEST setup with multi-timeframe confluence, or HOLD if nothing aligns.
-- CRITICAL: The "symbol" in your JSON must be EXACTLY one of the symbols listed above (copy-paste it).
+- CRITICAL: The "symbol" in your JSON must be EXACTLY one of the symbols listed above.
 - You MUST set stop_loss and take_profit at TECHNICAL levels (support/resistance, BBands, recent high/low).
 - For LONG: stop_loss MUST be BELOW entry price, take_profit MUST be ABOVE entry price.
 - For SHORT: stop_loss MUST be ABOVE entry price, take_profit MUST be BELOW entry price.
-- SL must be between 0.5% and 5% from entry. TP must give at least 2:1 reward:risk.
-- Use cross margin. Leverage 10-20x ONLY when 15m + 1h trends align and volume confirms.
-- Lower leverage (5-10x) when signals are mixed.
-- Keep leverage at or below 15x for altcoins outside the top 10 by volume.
+- SL should be between 0.5% and 5% from entry at a meaningful technical level.
+- TP must give at least 2:1 reward:risk ratio.
+- Leverage 10-20x when both timeframes align and volume confirms. 5-10x when mixed.
+- Keep leverage ≤15x for altcoins outside top 10 by volume.
 - Only trade if confidence >= 0.74.
-- Learn from recent performance: if losing, be more selective. If winning, maintain discipline.
+- You do NOT need to set size_usdt — the system auto-calculates based on risk budget and SL distance.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
   "symbol": "EXACT symbol from the list above",
   "action": "long" | "short" | "hold",
   "leverage": integer 1-20,
-  "size_usdt": number,
-  "stop_loss": number (BELOW entry for long, ABOVE entry for short),
-  "take_profit": number (ABOVE entry for long, BELOW entry for short),
+  "stop_loss": number (BELOW entry for long, ABOVE entry for short — at a technical level),
+  "take_profit": number (ABOVE entry for long, BELOW entry for short — ≥2x SL distance),
   "confidence": 0.00-1.00,
   "reason": "2-3 sentences citing specific indicators that create confluence"
 }}"""
@@ -786,12 +813,10 @@ For each candidate, evaluate:
     try:
         text = response.choices[0].message.content.strip()
         decision = parse_grok_json(text)
-
         if decision is None:
             print(f"   ⚠️ Could not parse Grok JSON — holding", flush=True)
             print(f"   [RAW]: {text[:200]}", flush=True)
             return {"action": "hold", "confidence": 0, "reason": "JSON parse failure"}
-
         raw_symbol = decision.get('symbol', '')
         normalized = normalize_symbol(raw_symbol)
         if normalized not in valid_symbols:
@@ -836,6 +861,7 @@ async def execute_trade(decision, balance):
         except Exception:
             pass
 
+        # Set leverage — auto-reduce if rejected
         leverage = min(decision.get("leverage", 10), 20)
         for lev in [leverage, 15, 10, 7, 5, 3]:
             try:
@@ -850,46 +876,65 @@ async def execute_trade(decision, balance):
                     raise
         print(f"   ⚙️ Set leverage: {leverage}x", flush=True)
 
-        max_size = balance * MAX_RISK_PERCENT / 100
-        size_usdt = min(decision.get("size_usdt", max_size), max_size)
-
-        min_notional = get_min_notional(symbol)
-        if size_usdt < min_notional:
-            print(f"   ⚠️ Size ${size_usdt:.2f} below minimum ${min_notional:.2f} — adjusting", flush=True)
-            size_usdt = min_notional * 1.1
-
+        # Get current price
         ticker = public_exchange.fetch_ticker(symbol)
         current_price = ticker['last']
 
+        # Validate SL/TP
         sl, tp = validate_sl_tp(action, current_price, sl, tp)
         sl = round_price(sl, symbol)
         tp = round_price(tp, symbol)
 
-        raw_amount = size_usdt / current_price
+        # === RISK-BASED POSITION SIZING ===
+        position_notional, margin_required, risk_amount = calculate_position_size(
+            balance, current_price, sl, leverage
+        )
+
+        # Check minimum notional
+        min_notional = get_min_notional(symbol)
+        if position_notional < min_notional:
+            print(f"   ⚠️ Notional ${position_notional:.2f} below minimum ${min_notional:.2f} — adjusting", flush=True)
+            position_notional = min_notional * 1.1
+            margin_required = position_notional / leverage
+
+        # Calculate amount in coins
+        raw_amount = position_notional / current_price
         amount = float(round_amount(raw_amount, symbol))
 
         if amount <= 0:
             print(f"   ⚠️ Calculated amount is 0 after rounding — skipping", flush=True)
             return False
 
+        # Recalculate actual notional after rounding
+        actual_notional = amount * current_price
+        actual_margin = actual_notional / leverage
+        sl_dist_pct = abs(current_price - sl) / current_price * 100
+        tp_dist_pct = abs(tp - current_price) / current_price * 100
+        actual_risk = actual_notional * abs(current_price - sl) / current_price
+
+        # Place entry order
         entry_side = "buy" if action == "long" else "sell"
         trading_exchange.create_market_order(symbol, entry_side, amount)
 
+        # Place stop loss
         sl_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
             None, {'stopPrice': sl, 'closePosition': True}
         )
 
+        # Place take profit
         tp_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
             None, {'stopPrice': tp, 'closePosition': True}
         )
 
-        log_trade_open(symbol, action, size_usdt, leverage, current_price, sl, tp, confidence,
-                       decision.get('reason', ''))
+        # Log the trade
+        log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
+                       confidence, decision.get('reason', ''), actual_margin, actual_risk)
 
+        # R:R ratio
         if action == "long":
             risk = abs(current_price - sl)
             reward = abs(tp - current_price)
@@ -898,8 +943,9 @@ async def execute_trade(decision, balance):
             reward = abs(current_price - tp)
         rr = reward / risk if risk > 0 else 0
 
-        print(f"   🔥 OPENED {action.upper()} {symbol} | ${size_usdt:,.0f} | {leverage}x Cross @ ${current_price:,.2f}", flush=True)
-        print(f"   🛑 SL: ${sl:,.2f} | 🎯 TP: ${tp:,.2f} | R:R {rr:.1f}:1", flush=True)
+        print(f"   🔥 OPENED {action.upper()} {symbol} @ ${current_price:,.2f} | {leverage}x Cross", flush=True)
+        print(f"   📐 Notional: ${actual_notional:,.0f} | Margin: ${actual_margin:,.0f} | Risk: ${actual_risk:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
+        print(f"   🛑 SL: ${sl:,.2f} (-{sl_dist_pct:.1f}%) | 🎯 TP: ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
         return True
 
@@ -941,7 +987,6 @@ async def scan_and_trade():
 # ============================================================
 
 def handle_position_close(symbol):
-    """Log PnL and clean up after a position closes."""
     try:
         raw_sym = symbol_to_binance_raw(symbol)
         incomes = trading_exchange.fapiprivate_get_income({
@@ -975,7 +1020,8 @@ async def main_loop():
     global last_position_symbol, had_position_last_cycle, session_start_balance
 
     print("🚀 High Leverage Top100 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
-    print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Max risk: {MAX_RISK_PERCENT}%", flush=True)
+    print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Risk per trade: {MAX_RISK_PERCENT}% | Max margin: {MAX_MARGIN_PERCENT}%", flush=True)
+    print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
     print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, multi-timeframe", flush=True)
     print("=" * 60, flush=True)
@@ -984,6 +1030,8 @@ async def main_loop():
         bal = trading_exchange.fetch_balance()
         session_start_balance = float(bal['total'].get('USDT', 0))
         print(f"💰 Session starting balance: ${session_start_balance:,.2f}", flush=True)
+        print(f"💵 Risk budget per trade: ${session_start_balance * MAX_RISK_PERCENT / 100:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
+        print(f"🏦 Max margin per trade: ${session_start_balance * MAX_MARGIN_PERCENT / 100:,.2f} ({MAX_MARGIN_PERCENT}%)", flush=True)
     except Exception:
         session_start_balance = 0
 
@@ -1020,12 +1068,12 @@ async def main_loop():
                 pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
                 print(f"\n[{now}] 📍 OPEN: {position['side'].upper()} {position['symbol']} | "
                       f"Entry ${position['entry_price']:,.2f} | {position['leverage']}x | "
+                      f"Notional ${position['notional']:,.0f} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
                 print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
-                    # Position was open last cycle, now it's closed
                     print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
                     handle_position_close(last_position_symbol)
                     last_position_symbol = None
@@ -1036,7 +1084,6 @@ async def main_loop():
                     print(f"\n[{now}] 🔍 Immediate rescan after close...", flush=True)
                     opened = await scan_and_trade()
                     if opened:
-                        # Track the new position immediately so fast close is detected
                         had_position_last_cycle = True
                         pos = get_open_position()
                         if pos:
