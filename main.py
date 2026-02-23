@@ -57,7 +57,10 @@ trading_exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'},
+    'options': {
+        'defaultType': 'future',
+        'warnOnFetchOpenOrdersWithoutSymbol': False,
+    },
 })
 trading_exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
