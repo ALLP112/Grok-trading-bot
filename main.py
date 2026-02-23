@@ -537,35 +537,19 @@ def place_emergency_sl_tp(position):
         tp = round_price(entry * 0.955, symbol)
         order_side = 'buy'
 
-    # Try closePosition first, fall back to amount-based
-    for use_close_pos in [True, False]:
-        try:
-            params_sl = {'stopPrice': sl}
-            params_tp = {'stopPrice': tp}
-            amount = contracts
-
-            if use_close_pos:
-                params_sl['closePosition'] = True
-                params_tp['closePosition'] = True
-
-            trading_exchange.create_order(
-                symbol, 'STOP_MARKET', order_side, amount,
-                None, params_sl
-            )
-            trading_exchange.create_order(
-                symbol, 'TAKE_PROFIT_MARKET', order_side, amount,
-                None, params_tp
-            )
-            print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}"
-                  f"{'' if use_close_pos else ' (amount-based)'}", flush=True)
-            return
-        except Exception as e:
-            if use_close_pos and ('-4509' in str(e) or 'GTE' in str(e)):
-                print(f"   ⚠️ closePosition rejected — retrying with amount-based orders...", flush=True)
-                continue
-            else:
-                print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
-                return
+    # Place amount-based SL/TP
+    try:
+        trading_exchange.create_order(
+            symbol, 'STOP_MARKET', order_side, contracts,
+            None, {'stopPrice': sl}
+        )
+        trading_exchange.create_order(
+            symbol, 'TAKE_PROFIT_MARKET', order_side, contracts,
+            None, {'stopPrice': tp}
+        )
+        print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
+    except Exception as e:
+        print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -1128,18 +1112,18 @@ async def execute_trade(decision, balance):
         entry_side = "buy" if action == "long" else "sell"
         trading_exchange.create_market_order(symbol, entry_side, amount)
 
-        # Place stop loss
+        # Place stop loss (amount-based — closePosition unreliable on demo)
         sl_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
-            None, {'stopPrice': sl, 'closePosition': True}
+            None, {'stopPrice': sl}
         )
 
-        # Place take profit
+        # Place take profit (amount-based)
         tp_side = "sell" if action == "long" else "buy"
         trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
-            None, {'stopPrice': tp, 'closePosition': True}
+            None, {'stopPrice': tp}
         )
 
         # Log the trade
