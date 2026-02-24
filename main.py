@@ -592,13 +592,14 @@ def has_sl_tp_orders(symbol):
             sl_alive = has_sl  # Preserve what we already know
             tp_alive = has_tp
 
-            # Check SL by ID
+            # Check SL by ID via raw API
             if not sl_alive and _active_sl_tp.get('sl_id'):
                 try:
-                    sl_check = trading_exchange.fetch_order(_active_sl_tp['sl_id'], symbol)
-                    sl_status = (sl_check.get('status') or '').lower()
-                    sl_raw_status = (sl_check.get('info', {}).get('status') or '').upper()
-                    sl_alive = sl_status in ('open', 'new', 'untriggered') or sl_raw_status in ('NEW', 'PARTIALLY_FILLED')
+                    raw_sym = symbol_to_binance_raw(symbol)
+                    sl_check = trading_exchange.fapiprivate_get_order({
+                        'symbol': raw_sym, 'orderId': _active_sl_tp['sl_id']
+                    })
+                    sl_alive = sl_check.get('status', '') in ('NEW', 'PARTIALLY_FILLED')
                 except Exception:
                     # Can't verify — trust placement age
                     sl_alive = True
@@ -606,10 +607,11 @@ def has_sl_tp_orders(symbol):
             # Check TP by ID (independent of SL result)
             if not tp_alive and _active_sl_tp.get('tp_id'):
                 try:
-                    tp_check = trading_exchange.fetch_order(_active_sl_tp['tp_id'], symbol)
-                    tp_status = (tp_check.get('status') or '').lower()
-                    tp_raw_status = (tp_check.get('info', {}).get('status') or '').upper()
-                    tp_alive = tp_status in ('open', 'new', 'untriggered') or tp_raw_status in ('NEW', 'PARTIALLY_FILLED')
+                    raw_sym = symbol_to_binance_raw(symbol)
+                    tp_check = trading_exchange.fapiprivate_get_order({
+                        'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']
+                    })
+                    tp_alive = tp_check.get('status', '') in ('NEW', 'PARTIALLY_FILLED')
                 except Exception:
                     # Can't verify — trust placement age
                     tp_alive = True
@@ -663,49 +665,55 @@ def place_emergency_sl_tp(position):
         tp = round_price(entry * 0.955, symbol)
         order_side = 'buy'
 
-    # Place amount-based SL/TP
+    # Place SL/TP using raw Binance API with closePosition
+    # (ccxt amount-based orders get auto-cancelled on demo)
     try:
-        print(f"   📋 Placing emergency orders: side={order_side} contracts={contracts} SL=${sl:,.2f} TP=${tp:,.2f}", flush=True)
+        raw_sym = symbol_to_binance_raw(symbol)
+        print(f"   📋 Placing emergency orders: side={order_side.upper()} closePosition SL=${sl:,.2f} TP=${tp:,.2f}", flush=True)
 
-        sl_order = trading_exchange.create_order(
-            symbol, 'STOP_MARKET', order_side, contracts,
-            None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-        )
-        print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')}", flush=True)
+        sl_result = trading_exchange.fapiprivate_post_order({
+            'symbol': raw_sym,
+            'side': order_side.upper(),
+            'type': 'STOP_MARKET',
+            'closePosition': 'true',
+            'stopPrice': str(sl),
+            'workingType': 'CONTRACT_PRICE',
+        })
+        sl_id = str(sl_result.get('orderId', 'unknown'))
+        print(f"   ✅ SL order placed: {sl_id}", flush=True)
 
-        tp_order = trading_exchange.create_order(
-            symbol, 'TAKE_PROFIT_MARKET', order_side, contracts,
-            None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-        )
-        print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')}", flush=True)
+        tp_result = trading_exchange.fapiprivate_post_order({
+            'symbol': raw_sym,
+            'side': order_side.upper(),
+            'type': 'TAKE_PROFIT_MARKET',
+            'closePosition': 'true',
+            'stopPrice': str(tp),
+            'workingType': 'CONTRACT_PRICE',
+        })
+        tp_id = str(tp_result.get('orderId', 'unknown'))
+        print(f"   ✅ TP order placed: {tp_id}", flush=True)
 
-        # Immediate verification — check if orders survived
+        # Immediate verification via raw API
         time.sleep(2)
         try:
-            if sl_order.get('id'):
-                sl_check = trading_exchange.fetch_order(sl_order['id'], symbol)
-                sl_stat = sl_check.get('status', 'unknown')
-                sl_raw = sl_check.get('info', {}).get('status', 'unknown')
-                print(f"   🔍 SL verify: status={sl_stat} raw={sl_raw}", flush=True)
-            if tp_order.get('id'):
-                tp_check = trading_exchange.fetch_order(tp_order['id'], symbol)
-                tp_stat = tp_check.get('status', 'unknown')
-                tp_raw = tp_check.get('info', {}).get('status', 'unknown')
-                print(f"   🔍 TP verify: status={tp_stat} raw={tp_raw}", flush=True)
+            sl_check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': sl_id})
+            print(f"   🔍 SL verify: status={sl_check.get('status', '?')}", flush=True)
+            tp_check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': tp_id})
+            print(f"   🔍 TP verify: status={tp_check.get('status', '?')}", flush=True)
         except Exception as ve:
-            print(f"   🔍 Post-placement verify error: {ve}", flush=True)
+            print(f"   🔍 Verify: {ve}", flush=True)
 
         print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
 
         # Track order IDs
         _active_sl_tp['symbol'] = symbol
-        _active_sl_tp['sl_id'] = sl_order.get('id')
-        _active_sl_tp['tp_id'] = tp_order.get('id')
+        _active_sl_tp['sl_id'] = sl_id
+        _active_sl_tp['tp_id'] = tp_id
         _active_sl_tp['placed_at'] = time.time()
 
     except Exception as e:
         print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
-        print(f"   ❌ Details: symbol={symbol} side={order_side} contracts={contracts} sl={sl} tp={tp}", flush=True)
+        print(f"   ❌ Details: symbol={symbol} side={order_side} sl={sl} tp={tp}", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -1374,34 +1382,45 @@ async def execute_trade(decision, balance):
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
                        confidence, decision.get('reason', ''), actual_margin, actual_risk)
 
-        # Place SL/TP in separate try/except — position exists, so failures are recoverable
-        sl_order = {'id': None}
-        tp_order = {'id': None}
-        sl_side = "sell" if action == "long" else "buy"
-        tp_side = sl_side  # Same side for both (closing the position)
+        # Place SL/TP via raw Binance API with closePosition
+        # (ccxt amount-based orders get auto-cancelled on demo)
+        raw_sym = symbol_to_binance_raw(symbol)
+        sl_side = "SELL" if action == "long" else "BUY"
+        sl_id = None
+        tp_id = None
 
         try:
-            sl_order = trading_exchange.create_order(
-                symbol, 'STOP_MARKET', sl_side, amount,
-                None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-            )
-            print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')} ({sl_side} @ ${sl:,.2f})", flush=True)
+            sl_result = trading_exchange.fapiprivate_post_order({
+                'symbol': raw_sym,
+                'side': sl_side,
+                'type': 'STOP_MARKET',
+                'closePosition': 'true',
+                'stopPrice': str(sl),
+                'workingType': 'CONTRACT_PRICE',
+            })
+            sl_id = str(sl_result.get('orderId', 'unknown'))
+            print(f"   ✅ SL order placed: {sl_id} ({sl_side} @ ${sl:,.2f})", flush=True)
         except Exception as sl_err:
             print(f"   ❌ SL placement failed: {sl_err}", flush=True)
 
         try:
-            tp_order = trading_exchange.create_order(
-                symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
-                None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-            )
-            print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
+            tp_result = trading_exchange.fapiprivate_post_order({
+                'symbol': raw_sym,
+                'side': sl_side,
+                'type': 'TAKE_PROFIT_MARKET',
+                'closePosition': 'true',
+                'stopPrice': str(tp),
+                'workingType': 'CONTRACT_PRICE',
+            })
+            tp_id = str(tp_result.get('orderId', 'unknown'))
+            print(f"   ✅ TP order placed: {tp_id} ({sl_side} @ ${tp:,.2f})", flush=True)
         except Exception as tp_err:
             print(f"   ❌ TP placement failed: {tp_err}", flush=True)
 
         # Track order IDs (even if one failed — we track what we have)
         _active_sl_tp['symbol'] = symbol
-        _active_sl_tp['sl_id'] = sl_order.get('id')
-        _active_sl_tp['tp_id'] = tp_order.get('id')
+        _active_sl_tp['sl_id'] = sl_id
+        _active_sl_tp['tp_id'] = tp_id
         _active_sl_tp['placed_at'] = time.time()
 
         # R:R ratio
@@ -1419,9 +1438,8 @@ async def execute_trade(decision, balance):
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
         # If either SL or TP failed to place, immediately try emergency
-        if not sl_order.get('id') or not tp_order.get('id'):
+        if not sl_id or sl_id == 'unknown' or not tp_id or tp_id == 'unknown':
             print(f"   🚨 SL/TP incomplete — attempting emergency placement...", flush=True)
-            # Cancel whatever partial orders exist
             cancel_all_open_orders(symbol)
             _active_sl_tp['sl_id'] = None
             _active_sl_tp['tp_id'] = None
@@ -1429,23 +1447,19 @@ async def execute_trade(decision, balance):
             if pos:
                 place_emergency_sl_tp(pos)
         else:
-            # Both orders returned IDs — verify they actually stuck
+            # Both orders returned IDs — verify they actually stuck via raw API
             await asyncio.sleep(3)
-            sl_verified = True  # Assume good unless proven otherwise
-            tp_verified = True
             try:
-                sl_check = trading_exchange.fetch_order(sl_order['id'], symbol)
-                sl_raw = (sl_check.get('info', {}).get('status') or '').upper()
-                sl_verified = sl_raw in ('NEW', 'PARTIALLY_FILLED')
-                print(f"   🔍 SL verify: raw_status={sl_raw} {'✅' if sl_verified else '❌'}", flush=True)
+                sl_check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': sl_id})
+                sl_status = sl_check.get('status', '?')
+                print(f"   🔍 SL verify: status={sl_status}", flush=True)
 
-                tp_check = trading_exchange.fetch_order(tp_order['id'], symbol)
-                tp_raw = (tp_check.get('info', {}).get('status') or '').upper()
-                tp_verified = tp_raw in ('NEW', 'PARTIALLY_FILLED')
-                print(f"   🔍 TP verify: raw_status={tp_raw} {'✅' if tp_verified else '❌'}", flush=True)
+                tp_check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': tp_id})
+                tp_status = tp_check.get('status', '?')
+                print(f"   🔍 TP verify: status={tp_status}", flush=True)
 
-                if not sl_verified or not tp_verified:
-                    print(f"   🚨 Orders were auto-cancelled by Binance — emergency re-place...", flush=True)
+                if sl_status not in ('NEW', 'PARTIALLY_FILLED') or tp_status not in ('NEW', 'PARTIALLY_FILLED'):
+                    print(f"   🚨 Orders auto-cancelled — emergency re-place...", flush=True)
                     cancel_all_open_orders(symbol)
                     _active_sl_tp['sl_id'] = None
                     _active_sl_tp['tp_id'] = None
