@@ -662,15 +662,31 @@ def place_emergency_sl_tp(position):
 
         sl_order = trading_exchange.create_order(
             symbol, 'STOP_MARKET', order_side, contracts,
-            None, {'stopPrice': sl}
+            None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
         )
         print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')}", flush=True)
 
         tp_order = trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', order_side, contracts,
-            None, {'stopPrice': tp}
+            None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
         )
         print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')}", flush=True)
+
+        # Immediate verification — check if orders survived
+        time.sleep(2)
+        try:
+            if sl_order.get('id'):
+                sl_check = trading_exchange.fetch_order(sl_order['id'], symbol)
+                sl_stat = sl_check.get('status', 'unknown')
+                sl_raw = sl_check.get('info', {}).get('status', 'unknown')
+                print(f"   🔍 SL verify: status={sl_stat} raw={sl_raw}", flush=True)
+            if tp_order.get('id'):
+                tp_check = trading_exchange.fetch_order(tp_order['id'], symbol)
+                tp_stat = tp_check.get('status', 'unknown')
+                tp_raw = tp_check.get('info', {}).get('status', 'unknown')
+                print(f"   🔍 TP verify: status={tp_stat} raw={tp_raw}", flush=True)
+        except Exception as ve:
+            print(f"   🔍 Post-placement verify error: {ve}", flush=True)
 
         print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
 
@@ -1297,7 +1313,7 @@ async def execute_trade(decision, balance):
         sl_side = "sell" if action == "long" else "buy"
         sl_order = trading_exchange.create_order(
             symbol, 'STOP_MARKET', sl_side, amount,
-            None, {'stopPrice': sl}
+            None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
         )
         print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')} ({sl_side} @ ${sl:,.2f})", flush=True)
 
@@ -1305,7 +1321,7 @@ async def execute_trade(decision, balance):
         tp_side = "sell" if action == "long" else "buy"
         tp_order = trading_exchange.create_order(
             symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
-            None, {'stopPrice': tp}
+            None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
         )
         print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
 
@@ -1481,7 +1497,6 @@ async def main_loop():
         if not has_sl or not has_tp:
             print(f"   🚨 Orphaned position detected: {position['side'].upper()} {position['symbol']} "
                   f"(SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'})", flush=True)
-            cancel_all_open_orders(position['symbol'])
             place_emergency_sl_tp(position)
         else:
             print(f"   📍 Existing position with SL/TP intact: {position['side'].upper()} {position['symbol']}", flush=True)
@@ -1515,11 +1530,25 @@ async def main_loop():
                 # Verify SL/TP orders still exist
                 has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
                 if not has_sl or not has_tp:
-                    print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
-                    cancel_all_open_orders(position['symbol'])
-                    place_emergency_sl_tp(position)
+                    # Check if we recently placed orders — don't re-place too aggressively
+                    if (_active_sl_tp.get('symbol') == position['symbol'] and
+                            _active_sl_tp.get('sl_id') and _active_sl_tp.get('tp_id')):
+                        age = time.time() - _active_sl_tp.get('placed_at', 0)
+                        if age < INTERVAL_MINUTES * 60 * 2:
+                            # We placed orders recently — they might exist but fetch can't see them
+                            # Don't cancel and re-place (that's what causes the loop!)
+                            print(f"   ⚠️ fetch_open_orders can't see SL/TP, but we placed them {age:.0f}s ago — skipping re-place", flush=True)
+                        else:
+                            # Orders are old enough that they should be visible — truly missing
+                            print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
+                            cancel_all_open_orders(position['symbol'])
+                            place_emergency_sl_tp(position)
+                    else:
+                        # No tracked orders — first time seeing this position without SL/TP
+                        print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — placing...", flush=True)
+                        place_emergency_sl_tp(position)
                 else:
-                    print(f"   ⏳ Waiting for SL/TP to trigger — not scanning for new trades", flush=True)
+                    print(f"   ⏳ SL/TP confirmed — waiting for trigger", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
