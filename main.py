@@ -544,13 +544,84 @@ def get_open_position():
 
 
 def has_sl_tp_orders(symbol):
+    """Check if a position has SL and TP orders — tries ccxt then raw Binance endpoint."""
+    has_sl = False
+    has_tp = False
+    all_orders = []
+
+    # Method 1: ccxt fetch_open_orders
     try:
         orders = trading_exchange.fetch_open_orders(symbol)
-        has_sl = any(o.get('type', '').upper() in ('STOP_MARKET', 'STOP') for o in orders)
-        has_tp = any(o.get('type', '').upper() in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT') for o in orders)
-        return has_sl, has_tp, orders
-    except Exception:
-        return False, False, []
+        all_orders = orders
+        for o in orders:
+            otype = (o.get('type') or '').upper()
+            oraw = (o.get('info', {}).get('type') or '').upper()
+            if otype in ('STOP_MARKET', 'STOP') or oraw in ('STOP_MARKET', 'STOP'):
+                has_sl = True
+            if otype in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT') or oraw in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
+                has_tp = True
+    except Exception as e:
+        print(f"   🔍 fetch_open_orders failed: {e}", flush=True)
+
+    # Method 2: raw Binance endpoint if ccxt missed them
+    if not has_sl or not has_tp:
+        try:
+            raw_sym = symbol_to_binance_raw(symbol)
+            raw_orders = trading_exchange.fapiprivate_get_openorders({'symbol': raw_sym})
+            for ro in raw_orders:
+                ro_type = (ro.get('type') or '').upper()
+                if ro_type in ('STOP_MARKET', 'STOP'):
+                    has_sl = True
+                if ro_type in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
+                    has_tp = True
+            if not has_sl or not has_tp:
+                print(f"   🔍 Both methods: 0 SL/TP found (ccxt={len(all_orders)}, raw={len(raw_orders)} orders)", flush=True)
+                # Show what we do see
+                for ro in raw_orders[:5]:
+                    print(f"      raw: type={ro.get('type')} side={ro.get('side')} status={ro.get('status')} stopPrice={ro.get('stopPrice')}", flush=True)
+        except Exception as e2:
+            print(f"   🔍 Raw endpoint failed: {e2}", flush=True)
+
+    # Method 3: trust our own tracking if we recently placed orders
+    if (not has_sl or not has_tp) and _active_sl_tp.get('symbol') == symbol:
+        placed_at = _active_sl_tp.get('placed_at', 0)
+        age = time.time() - placed_at
+        if age < 1200:  # Within 20 minutes — trust our records
+            # Verify by querying specific order IDs
+            sl_alive = False
+            tp_alive = False
+            try:
+                if _active_sl_tp.get('sl_id'):
+                    sl_check = trading_exchange.fetch_order(_active_sl_tp['sl_id'], symbol)
+                    sl_status = (sl_check.get('status') or '').lower()
+                    sl_raw_status = (sl_check.get('info', {}).get('status') or '').upper()
+                    sl_alive = sl_status in ('open', 'new', 'untriggered') or sl_raw_status in ('NEW', 'PARTIALLY_FILLED')
+                if _active_sl_tp.get('tp_id'):
+                    tp_check = trading_exchange.fetch_order(_active_sl_tp['tp_id'], symbol)
+                    tp_status = (tp_check.get('status') or '').lower()
+                    tp_raw_status = (tp_check.get('info', {}).get('status') or '').upper()
+                    tp_alive = tp_status in ('open', 'new', 'untriggered') or tp_raw_status in ('NEW', 'PARTIALLY_FILLED')
+            except Exception as e:
+                # If we can't query by ID, trust placement within grace period
+                print(f"   🔍 Cannot verify by order ID ({e}) — trusting placement ({age:.0f}s ago)", flush=True)
+                sl_alive = _active_sl_tp.get('sl_id') is not None
+                tp_alive = _active_sl_tp.get('tp_id') is not None
+
+            if sl_alive or tp_alive:
+                print(f"   🔍 Order verification: SL={'✅' if sl_alive else '❌'} TP={'✅' if tp_alive else '❌'} (placed {age:.0f}s ago)", flush=True)
+                has_sl = sl_alive
+                has_tp = tp_alive
+
+    return has_sl, has_tp, all_orders
+
+
+# Track placed order IDs
+_active_sl_tp = {
+    'symbol': None,
+    'sl_id': None,
+    'tp_id': None,
+    'placed_at': 0,
+}
 
 
 def place_emergency_sl_tp(position):
@@ -602,6 +673,13 @@ def place_emergency_sl_tp(position):
         print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')}", flush=True)
 
         print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
+
+        # Track order IDs
+        _active_sl_tp['symbol'] = symbol
+        _active_sl_tp['sl_id'] = sl_order.get('id')
+        _active_sl_tp['tp_id'] = tp_order.get('id')
+        _active_sl_tp['placed_at'] = time.time()
+
     except Exception as e:
         print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
         print(f"   ❌ Details: symbol={symbol} side={order_side} contracts={contracts} sl={sl} tp={tp}", flush=True)
@@ -1223,6 +1301,12 @@ async def execute_trade(decision, balance):
         )
         print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
 
+        # Track order IDs
+        _active_sl_tp['symbol'] = symbol
+        _active_sl_tp['sl_id'] = sl_order.get('id')
+        _active_sl_tp['tp_id'] = tp_order.get('id')
+        _active_sl_tp['placed_at'] = time.time()
+
         # Log the trade
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
                        confidence, decision.get('reason', ''), actual_margin, actual_risk)
@@ -1323,6 +1407,12 @@ def handle_position_close(symbol):
         print(f"   ⚠️ Could not fetch realized PnL: {e}", flush=True)
 
     cancel_all_open_orders(symbol)
+
+    # Clear order tracking
+    _active_sl_tp['symbol'] = None
+    _active_sl_tp['sl_id'] = None
+    _active_sl_tp['tp_id'] = None
+    _active_sl_tp['placed_at'] = 0
 
 
 # ============================================================
