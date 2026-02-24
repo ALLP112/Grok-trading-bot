@@ -13,6 +13,7 @@ import asyncio
 import math
 import time
 import re
+import traceback
 from datetime import datetime, UTC
 from openai import AsyncOpenAI
 import ccxt
@@ -223,7 +224,7 @@ async def retry_async(func, retries=2, delay=5, label=""):
         try:
             return await func()
         except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout,
-                ConnectionError, TimeoutError) as e:
+                ccxt.DDoSProtection, ConnectionError, TimeoutError) as e:
             last_error = e
             if attempt < retries - 1:
                 print(f"   🔁 Retry {attempt + 1}/{retries - 1} for {label}: {e}", flush=True)
@@ -241,7 +242,7 @@ def retry_sync(func, retries=2, delay=5, label=""):
         try:
             return func()
         except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout,
-                ConnectionError, TimeoutError) as e:
+                ccxt.DDoSProtection, ConnectionError, TimeoutError) as e:
             last_error = e
             if attempt < retries - 1:
                 print(f"   🔁 Retry {attempt + 1}/{retries - 1} for {label}: {e}", flush=True)
@@ -510,6 +511,7 @@ def get_open_position():
     try:
         positions = retry_sync(
             lambda: trading_exchange.fetch_positions(),
+            retries=3, delay=10,
             label="fetch_positions"
         )
         for pos in positions:
@@ -582,33 +584,38 @@ def has_sl_tp_orders(symbol):
         except Exception as e2:
             print(f"   🔍 Raw endpoint failed: {e2}", flush=True)
 
-    # Method 3: trust our own tracking if we recently placed orders
+    # Method 3: verify by querying specific order IDs we tracked
     if (not has_sl or not has_tp) and _active_sl_tp.get('symbol') == symbol:
         placed_at = _active_sl_tp.get('placed_at', 0)
         age = time.time() - placed_at
-        if age < 1200:  # Within 20 minutes — trust our records
-            # Verify by querying specific order IDs
-            sl_alive = False
-            tp_alive = False
-            try:
-                if _active_sl_tp.get('sl_id'):
+        if age < 1200:  # Within 20 minutes
+            sl_alive = has_sl  # Preserve what we already know
+            tp_alive = has_tp
+
+            # Check SL by ID
+            if not sl_alive and _active_sl_tp.get('sl_id'):
+                try:
                     sl_check = trading_exchange.fetch_order(_active_sl_tp['sl_id'], symbol)
                     sl_status = (sl_check.get('status') or '').lower()
                     sl_raw_status = (sl_check.get('info', {}).get('status') or '').upper()
                     sl_alive = sl_status in ('open', 'new', 'untriggered') or sl_raw_status in ('NEW', 'PARTIALLY_FILLED')
-                if _active_sl_tp.get('tp_id'):
+                except Exception:
+                    # Can't verify — trust placement age
+                    sl_alive = True
+
+            # Check TP by ID (independent of SL result)
+            if not tp_alive and _active_sl_tp.get('tp_id'):
+                try:
                     tp_check = trading_exchange.fetch_order(_active_sl_tp['tp_id'], symbol)
                     tp_status = (tp_check.get('status') or '').lower()
                     tp_raw_status = (tp_check.get('info', {}).get('status') or '').upper()
                     tp_alive = tp_status in ('open', 'new', 'untriggered') or tp_raw_status in ('NEW', 'PARTIALLY_FILLED')
-            except Exception as e:
-                # If we can't query by ID, trust placement within grace period
-                print(f"   🔍 Cannot verify by order ID ({e}) — trusting placement ({age:.0f}s ago)", flush=True)
-                sl_alive = _active_sl_tp.get('sl_id') is not None
-                tp_alive = _active_sl_tp.get('tp_id') is not None
+                except Exception:
+                    # Can't verify — trust placement age
+                    tp_alive = True
 
             if sl_alive or tp_alive:
-                print(f"   🔍 Order verification: SL={'✅' if sl_alive else '❌'} TP={'✅' if tp_alive else '❌'} (placed {age:.0f}s ago)", flush=True)
+                print(f"   🔍 Order tracking: SL={'✅' if sl_alive else '❌'} TP={'✅' if tp_alive else '❌'} (placed {age:.0f}s ago)", flush=True)
                 has_sl = sl_alive
                 has_tp = tp_alive
 
@@ -702,33 +709,81 @@ def place_emergency_sl_tp(position):
 
 
 def cancel_all_open_orders(symbol):
+    """Cancel ALL orders including conditional (STOP_MARKET, TAKE_PROFIT_MARKET).
+    Uses both ccxt and raw Binance endpoint since fetch_open_orders can't see conditionals on demo."""
+    cancelled = 0
+
+    # Method 1: ccxt (catches regular orders)
     try:
         open_orders = trading_exchange.fetch_open_orders(symbol)
         for order in open_orders:
-            trading_exchange.cancel_order(order['id'], symbol)
-        if open_orders:
-            print(f"   🧹 Cancelled {len(open_orders)} open orders on {symbol}", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ Error cancelling orders on {symbol}: {e}", flush=True)
+            try:
+                trading_exchange.cancel_order(order['id'], symbol)
+                cancelled += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Method 2: raw Binance endpoint (catches conditional orders ccxt misses)
+    try:
+        raw_sym = symbol_to_binance_raw(symbol)
+        raw_orders = trading_exchange.fapiprivate_get_openorders({'symbol': raw_sym})
+        for ro in raw_orders:
+            try:
+                trading_exchange.fapiprivate_delete_order({
+                    'symbol': raw_sym,
+                    'orderId': ro['orderId'],
+                })
+                cancelled += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Method 3: nuclear option — only if methods 1+2 found nothing but we know orders should exist
+    if cancelled == 0 and _active_sl_tp.get('symbol') == symbol and _active_sl_tp.get('sl_id'):
+        try:
+            raw_sym = symbol_to_binance_raw(symbol)
+            trading_exchange.fapiprivate_delete_allopenorders({'symbol': raw_sym})
+            print(f"   🧹 Force-cancelled all orders on {symbol}", flush=True)
+        except Exception:
+            pass
+    elif cancelled > 0:
+        print(f"   🧹 Cancelled {cancelled} orders on {symbol}", flush=True)
 
 
 def cleanup_all_orders():
+    """Startup cleanup: cancel orphaned orders not belonging to current position."""
     try:
-        all_orders = trading_exchange.fetch_open_orders()
-        if all_orders:
-            position = get_open_position()
-            pos_symbol = position['symbol'] if position else None
-            orphan_orders = [o for o in all_orders if o['symbol'] != pos_symbol]
-            if orphan_orders:
-                print(f"   🧹 Found {len(orphan_orders)} orphan orders — cleaning up...", flush=True)
-                for order in orphan_orders:
+        position = get_open_position()
+        pos_symbol = position['symbol'] if position else None
+
+        # Get ALL open orders across all symbols via raw endpoint
+        try:
+            raw_orders = trading_exchange.fapiprivate_get_openorders()
+            if raw_orders:
+                orphan_count = 0
+                for ro in raw_orders:
+                    ro_symbol = ro.get('symbol', '')
+                    # If no position, cancel everything. If position exists, keep its orders.
+                    if pos_symbol and ro_symbol == symbol_to_binance_raw(pos_symbol):
+                        continue
                     try:
-                        trading_exchange.cancel_order(order['id'], order['symbol'])
+                        trading_exchange.fapiprivate_delete_order({
+                            'symbol': ro_symbol,
+                            'orderId': ro['orderId'],
+                        })
+                        orphan_count += 1
                     except Exception:
                         pass
-                print(f"   🧹 Cleanup complete", flush=True)
-            if position:
-                print(f"   📍 Existing position found on {pos_symbol} — keeping its orders", flush=True)
+                if orphan_count:
+                    print(f"   🧹 Cleaned up {orphan_count} orphan orders", flush=True)
+        except Exception:
+            pass
+
+        if position:
+            print(f"   📍 Existing position on {pos_symbol}", flush=True)
     except Exception as e:
         print(f"   ⚠️ Cleanup error: {e}", flush=True)
 
@@ -1221,6 +1276,12 @@ async def execute_trade(decision, balance):
         print(f"   ⚠️ Missing symbol/SL/TP in Grok response — skipping", flush=True)
         return False
 
+    # Safety: don't open if we already have a position
+    existing = get_open_position()
+    if existing:
+        print(f"   ⚠️ Already have {existing['side'].upper()} {existing['symbol']} — skipping new trade", flush=True)
+        return False
+
     try:
         get_cached_markets()
         cancel_all_open_orders(symbol)
@@ -1309,31 +1370,39 @@ async def execute_trade(decision, balance):
         entry_side = "buy" if action == "long" else "sell"
         trading_exchange.create_market_order(symbol, entry_side, amount)
 
-        # Place stop loss (amount-based — closePosition unreliable on demo)
+        # Log the trade immediately (position IS open now regardless of SL/TP success)
+        log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
+                       confidence, decision.get('reason', ''), actual_margin, actual_risk)
+
+        # Place SL/TP in separate try/except — position exists, so failures are recoverable
+        sl_order = {'id': None}
+        tp_order = {'id': None}
         sl_side = "sell" if action == "long" else "buy"
-        sl_order = trading_exchange.create_order(
-            symbol, 'STOP_MARKET', sl_side, amount,
-            None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-        )
-        print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')} ({sl_side} @ ${sl:,.2f})", flush=True)
+        tp_side = sl_side  # Same side for both (closing the position)
 
-        # Place take profit (amount-based)
-        tp_side = "sell" if action == "long" else "buy"
-        tp_order = trading_exchange.create_order(
-            symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
-            None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
-        )
-        print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
+        try:
+            sl_order = trading_exchange.create_order(
+                symbol, 'STOP_MARKET', sl_side, amount,
+                None, {'stopPrice': sl, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
+            )
+            print(f"   ✅ SL order placed: {sl_order.get('id', 'unknown')} ({sl_side} @ ${sl:,.2f})", flush=True)
+        except Exception as sl_err:
+            print(f"   ❌ SL placement failed: {sl_err}", flush=True)
 
-        # Track order IDs
+        try:
+            tp_order = trading_exchange.create_order(
+                symbol, 'TAKE_PROFIT_MARKET', tp_side, amount,
+                None, {'stopPrice': tp, 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
+            )
+            print(f"   ✅ TP order placed: {tp_order.get('id', 'unknown')} ({tp_side} @ ${tp:,.2f})", flush=True)
+        except Exception as tp_err:
+            print(f"   ❌ TP placement failed: {tp_err}", flush=True)
+
+        # Track order IDs (even if one failed — we track what we have)
         _active_sl_tp['symbol'] = symbol
         _active_sl_tp['sl_id'] = sl_order.get('id')
         _active_sl_tp['tp_id'] = tp_order.get('id')
         _active_sl_tp['placed_at'] = time.time()
-
-        # Log the trade
-        log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
-                       confidence, decision.get('reason', ''), actual_margin, actual_risk)
 
         # R:R ratio
         if action == "long":
@@ -1349,18 +1418,44 @@ async def execute_trade(decision, balance):
         print(f"   🛑 SL: ${sl:,.2f} (-{sl_dist_pct:.1f}%) | 🎯 TP: ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
-        # Verify orders were placed
-        await asyncio.sleep(2)
-        has_sl, has_tp, _ = has_sl_tp_orders(symbol)
-        if not has_sl or not has_tp:
-            print(f"   ⚠️ Post-trade verification: SL={'✅' if has_sl else '❌'} TP={'✅' if has_tp else '❌'}", flush=True)
-            if not has_sl and not has_tp:
-                print(f"   🚨 Both orders missing — re-placing...", flush=True)
-                pos = get_open_position()
-                if pos:
-                    place_emergency_sl_tp(pos)
+        # If either SL or TP failed to place, immediately try emergency
+        if not sl_order.get('id') or not tp_order.get('id'):
+            print(f"   🚨 SL/TP incomplete — attempting emergency placement...", flush=True)
+            # Cancel whatever partial orders exist
+            cancel_all_open_orders(symbol)
+            _active_sl_tp['sl_id'] = None
+            _active_sl_tp['tp_id'] = None
+            pos = get_open_position()
+            if pos:
+                place_emergency_sl_tp(pos)
         else:
-            print(f"   ✅ SL/TP verified on exchange", flush=True)
+            # Both orders returned IDs — verify they actually stuck
+            await asyncio.sleep(3)
+            sl_verified = True  # Assume good unless proven otherwise
+            tp_verified = True
+            try:
+                sl_check = trading_exchange.fetch_order(sl_order['id'], symbol)
+                sl_raw = (sl_check.get('info', {}).get('status') or '').upper()
+                sl_verified = sl_raw in ('NEW', 'PARTIALLY_FILLED')
+                print(f"   🔍 SL verify: raw_status={sl_raw} {'✅' if sl_verified else '❌'}", flush=True)
+
+                tp_check = trading_exchange.fetch_order(tp_order['id'], symbol)
+                tp_raw = (tp_check.get('info', {}).get('status') or '').upper()
+                tp_verified = tp_raw in ('NEW', 'PARTIALLY_FILLED')
+                print(f"   🔍 TP verify: raw_status={tp_raw} {'✅' if tp_verified else '❌'}", flush=True)
+
+                if not sl_verified or not tp_verified:
+                    print(f"   🚨 Orders were auto-cancelled by Binance — emergency re-place...", flush=True)
+                    cancel_all_open_orders(symbol)
+                    _active_sl_tp['sl_id'] = None
+                    _active_sl_tp['tp_id'] = None
+                    _active_sl_tp['symbol'] = None
+                    pos = get_open_position()
+                    if pos:
+                        place_emergency_sl_tp(pos)
+            except Exception as ve:
+                # Can't verify — trust the placement (IDs were returned)
+                print(f"   🔍 Verification unavailable ({ve}) — trusting order IDs", flush=True)
 
         return True
 
@@ -1405,8 +1500,12 @@ async def scan_and_trade():
         opened = await execute_trade(decision, balance)
         return opened
 
-    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
-        print(f"   🚫 Rate limited during scan — skipping this cycle: {str(e)[:80]}", flush=True)
+    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout, ccxt.NetworkError) as e:
+        print(f"   🚫 Exchange error during scan — skipping this cycle: {str(e)[:80]}", flush=True)
+        return False
+    except Exception as e:
+        print(f"   ❌ Unexpected scan error: {e}", flush=True)
+        traceback.print_exc()
         return False
 
 
@@ -1434,6 +1533,20 @@ def handle_position_close(symbol):
     except Exception as e:
         print(f"   ⚠️ Could not fetch realized PnL: {e}", flush=True)
 
+    # Cancel remaining orders (the other side of SL/TP that didn't trigger)
+    # First try tracked IDs directly
+    for order_id in [_active_sl_tp.get('sl_id'), _active_sl_tp.get('tp_id')]:
+        if order_id:
+            try:
+                raw_sym = symbol_to_binance_raw(symbol)
+                trading_exchange.fapiprivate_delete_order({
+                    'symbol': raw_sym,
+                    'orderId': order_id,
+                })
+            except Exception:
+                pass  # Already cancelled or triggered
+
+    # Then sweep anything remaining
     cancel_all_open_orders(symbol)
 
     # Clear order tracking
@@ -1493,13 +1606,20 @@ async def main_loop():
     # Check for orphaned position on startup
     position = get_open_position()
     if position:
-        has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
-        if not has_sl or not has_tp:
-            print(f"   🚨 Orphaned position detected: {position['side'].upper()} {position['symbol']} "
-                  f"(SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'})", flush=True)
-            place_emergency_sl_tp(position)
-        else:
-            print(f"   📍 Existing position with SL/TP intact: {position['side'].upper()} {position['symbol']}", flush=True)
+        # On restart, we have no tracking state. Nuclear cancel EVERYTHING first to prevent duplicate orders.
+        print(f"   📍 Found existing position: {position['side'].upper()} {position['symbol']}", flush=True)
+        try:
+            raw_sym = symbol_to_binance_raw(position['symbol'])
+            trading_exchange.fapiprivate_delete_allopenorders({'symbol': raw_sym})
+            print(f"   🧹 Nuclear cancelled all orders on {position['symbol']}", flush=True)
+        except Exception as e:
+            print(f"   ⚠️ Nuclear cancel failed: {e} — trying regular cancel", flush=True)
+            cancel_all_open_orders(position['symbol'])
+        await asyncio.sleep(2)
+
+        # Place fresh SL/TP (we just nuked everything, so definitely need new ones)
+        print(f"   🚨 Placing fresh emergency SL/TP after restart", flush=True)
+        place_emergency_sl_tp(position)
         last_position_symbol = position['symbol']
         had_position_last_cycle = True
 
@@ -1552,20 +1672,31 @@ async def main_loop():
 
             else:
                 if had_position_last_cycle and last_position_symbol:
-                    print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
-                    handle_position_close(last_position_symbol)
-                    last_position_symbol = None
-                    had_position_last_cycle = False
-                    print_pnl_dashboard()
-
-                    # Immediate rescan
-                    print(f"\n[{now}] 🔍 Immediate rescan after close...", flush=True)
-                    opened = await scan_and_trade()
-                    if opened:
+                    # CRITICAL: Double-check before assuming position is closed
+                    # A transient API error could make get_open_position return None
+                    await asyncio.sleep(2)
+                    recheck = get_open_position()
+                    if recheck:
+                        # False alarm — position is still open
+                        print(f"\n[{now}] ⚠️ Position re-detected after transient glitch — {recheck['side'].upper()} {recheck['symbol']}", flush=True)
+                        last_position_symbol = recheck['symbol']
                         had_position_last_cycle = True
-                        pos = get_open_position()
-                        if pos:
-                            last_position_symbol = pos['symbol']
+                    else:
+                        # Confirmed closed
+                        print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
+                        handle_position_close(last_position_symbol)
+                        last_position_symbol = None
+                        had_position_last_cycle = False
+                        print_pnl_dashboard()
+
+                        # Immediate rescan
+                        print(f"\n[{now}] 🔍 Immediate rescan after close...", flush=True)
+                        opened = await scan_and_trade()
+                        if opened:
+                            had_position_last_cycle = True
+                            pos = get_open_position()
+                            if pos:
+                                last_position_symbol = pos['symbol']
 
                 else:
                     print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
@@ -1599,10 +1730,26 @@ async def main_loop():
             continue  # Skip the normal sleep, retry immediately
 
         except Exception as e:
-            print(f"Loop error: {e}", flush=True)
+            print(f"   ❌ Loop error: {e}", flush=True)
+            traceback.print_exc()
 
         await asyncio.sleep(INTERVAL_MINUTES * 60)
 
 
-print("Starting main loop...", flush=True)
-asyncio.run(main_loop())
+# Crash-proof wrapper — restart on unexpected death
+def run_forever():
+    while True:
+        try:
+            print("Starting main loop...", flush=True)
+            asyncio.run(main_loop())
+        except KeyboardInterrupt:
+            print("Shutting down...", flush=True)
+            break
+        except Exception as e:
+            print(f"💀 FATAL: Main loop died — {e}", flush=True)
+            traceback.print_exc()
+            print(f"🔄 Restarting in 60s...", flush=True)
+            time.sleep(60)
+
+
+run_forever()
