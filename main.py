@@ -1309,7 +1309,7 @@ async def execute_trade(decision, balance):
     tp = decision.get("take_profit")
 
     if action == "hold" or confidence < 0.74:
-        print(f"   ⏸️  HOLD — confidence {confidence:.2f} | {decision.get('reason', 'n/a')}", flush=True)
+        print(f"   💤 HOLD — confidence {confidence:.2f} | {decision.get('reason', 'n/a')}", flush=True)
         return False
 
     if not symbol or not sl or not tp:
