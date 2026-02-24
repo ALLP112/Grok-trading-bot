@@ -820,6 +820,10 @@ async def get_top_candidates(n=100):
     if not tickers:
         print(f"   ❌ Could not fetch tickers — skipping scan", flush=True)
         return []
+    # TradFi symbols that require separate Binance agreement — skip these
+    TRADFI_BASES = {'XAG', 'XAU', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'XPT', 'XPD',
+                    'USO', 'SPX', 'NDX', 'DJI', 'VIX', 'NAS', 'RUS'}
+
     markets = public_exchange.markets or {}
     candidates = []
     for symbol, ticker in tickers.items():
@@ -827,6 +831,10 @@ async def get_top_candidates(n=100):
         if ('USDT' in symbol
                 and market.get('swap', False)
                 and market.get('active', True)):
+            # Skip TradFi perps
+            base = market.get('base', '')
+            if base in TRADFI_BASES:
+                continue
             vol = ticker.get('quoteVolume') or 0
             candidates.append({
                 'symbol': symbol,
@@ -1341,7 +1349,11 @@ async def execute_trade(decision, balance):
         return True
 
     except Exception as e:
-        print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
+        err_str = str(e)
+        if '-4411' in err_str or 'TradFi' in err_str:
+            print(f"   ⚠️ {symbol} requires TradFi agreement — skipping", flush=True)
+        else:
+            print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
         return False
 
 
