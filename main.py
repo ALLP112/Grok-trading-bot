@@ -66,6 +66,9 @@ trading_exchange = ccxt.binance({
 trading_exchange.enable_demo_trading(True)
 print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
 
+# Runtime blacklist — symbols where SL/TP placement fails (e.g. -4120 algo order required)
+_blacklisted_symbols = set()
+
 
 # ============================================================
 #  MARKET CACHE
@@ -634,12 +637,13 @@ _active_sl_tp = {
 
 
 def place_emergency_sl_tp(position):
+    """Place emergency SL/TP. Returns True if successful, False if failed."""
     symbol = position['symbol']
     side = position['side']
     entry = position['entry_price']
     if entry <= 0:
         print(f"   ⚠️ Cannot place emergency SL/TP — entry price unknown", flush=True)
-        return
+        return False
 
     # Wait for Binance to fully register the position
     time.sleep(3)
@@ -648,7 +652,7 @@ def place_emergency_sl_tp(position):
     current_pos = get_open_position()
     if not current_pos or current_pos['symbol'] != symbol:
         print(f"   ⚠️ Position no longer exists — skipping emergency SL/TP", flush=True)
-        return
+        return False
 
     contracts = current_pos['contracts']
     side = current_pos['side']  # Use re-verified side
@@ -666,7 +670,6 @@ def place_emergency_sl_tp(position):
         order_side = 'buy'
 
     # Place SL/TP using raw Binance API with closePosition
-    # (ccxt amount-based orders get auto-cancelled on demo)
     try:
         raw_sym = symbol_to_binance_raw(symbol)
         print(f"   📋 Placing emergency orders: side={order_side.upper()} closePosition SL=${sl:,.2f} TP=${tp:,.2f}", flush=True)
@@ -710,10 +713,36 @@ def place_emergency_sl_tp(position):
         _active_sl_tp['sl_id'] = sl_id
         _active_sl_tp['tp_id'] = tp_id
         _active_sl_tp['placed_at'] = time.time()
+        return True
 
     except Exception as e:
+        err_str = str(e)
         print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
-        print(f"   ❌ Details: symbol={symbol} side={order_side} sl={sl} tp={tp}", flush=True)
+
+        # Blacklist symbols that don't support stop orders
+        if '-4120' in err_str or 'Algo Order' in err_str:
+            _blacklisted_symbols.add(symbol)
+            print(f"   🚫 {symbol} blacklisted — doesn't support stop orders", flush=True)
+
+        return False
+
+
+def force_close_position(symbol, reason=""):
+    """Emergency close — market order to flatten position immediately."""
+    pos = get_open_position()
+    if not pos or pos['symbol'] != symbol:
+        return
+    close_side = 'sell' if pos['side'] == 'long' else 'buy'
+    try:
+        trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
+        print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
+        cancel_all_open_orders(symbol)
+        _active_sl_tp['symbol'] = None
+        _active_sl_tp['sl_id'] = None
+        _active_sl_tp['tp_id'] = None
+        _active_sl_tp['placed_at'] = 0
+    except Exception as e:
+        print(f"   💀 CRITICAL: Could not force-close {symbol}: {e}", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -913,6 +942,9 @@ async def get_top_candidates(n=100):
             # Skip TradFi perps
             base = market.get('base', '')
             if base in TRADFI_BASES:
+                continue
+            # Skip symbols that previously failed SL/TP placement
+            if symbol in _blacklisted_symbols:
                 continue
             vol = ticker.get('quoteVolume') or 0
             candidates.append({
@@ -1402,6 +1434,9 @@ async def execute_trade(decision, balance):
             print(f"   ✅ SL order placed: {sl_id} ({sl_side} @ ${sl:,.2f})", flush=True)
         except Exception as sl_err:
             print(f"   ❌ SL placement failed: {sl_err}", flush=True)
+            if '-4120' in str(sl_err):
+                _blacklisted_symbols.add(symbol)
+                print(f"   🚫 {symbol} blacklisted — doesn't support stop orders", flush=True)
 
         try:
             tp_result = trading_exchange.fapiprivate_post_order({
@@ -1445,7 +1480,11 @@ async def execute_trade(decision, balance):
             _active_sl_tp['tp_id'] = None
             pos = get_open_position()
             if pos:
-                place_emergency_sl_tp(pos)
+                success = place_emergency_sl_tp(pos)
+                if not success:
+                    # CANNOT protect this position — close it immediately
+                    force_close_position(symbol, "SL/TP not supported on this symbol")
+                    return False
         else:
             # Both orders returned IDs — verify they actually stuck via raw API
             await asyncio.sleep(3)
@@ -1466,7 +1505,10 @@ async def execute_trade(decision, balance):
                     _active_sl_tp['symbol'] = None
                     pos = get_open_position()
                     if pos:
-                        place_emergency_sl_tp(pos)
+                        success = place_emergency_sl_tp(pos)
+                        if not success:
+                            force_close_position(symbol, "SL/TP orders auto-cancelled and can't be re-placed")
+                            return False
             except Exception as ve:
                 # Can't verify — trust the placement (IDs were returned)
                 print(f"   🔍 Verification unavailable ({ve}) — trusting order IDs", flush=True)
@@ -1477,8 +1519,22 @@ async def execute_trade(decision, balance):
         err_str = str(e)
         if '-4411' in err_str or 'TradFi' in err_str:
             print(f"   ⚠️ {symbol} requires TradFi agreement — skipping", flush=True)
+        elif '-4120' in err_str or 'Algo Order' in err_str:
+            print(f"   ⚠️ {symbol} requires Algo Order API — blacklisting", flush=True)
+            _blacklisted_symbols.add(symbol)
+            # If we opened a position, close it
+            pos = get_open_position()
+            if pos and pos['symbol'] == symbol:
+                force_close_position(symbol, "Symbol doesn't support stop orders")
         else:
             print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
+            # Check if we have a naked position from a partial execution
+            pos = get_open_position()
+            if pos and pos['symbol'] == symbol:
+                # Try emergency SL/TP
+                success = place_emergency_sl_tp(pos)
+                if not success:
+                    force_close_position(symbol, "Can't protect position after execution error")
         return False
 
 
@@ -1633,9 +1689,13 @@ async def main_loop():
 
         # Place fresh SL/TP (we just nuked everything, so definitely need new ones)
         print(f"   🚨 Placing fresh emergency SL/TP after restart", flush=True)
-        place_emergency_sl_tp(position)
-        last_position_symbol = position['symbol']
-        had_position_last_cycle = True
+        success = place_emergency_sl_tp(position)
+        if not success:
+            force_close_position(position['symbol'], "Can't place SL/TP on restart")
+            position = None  # Reset so we scan fresh
+        else:
+            last_position_symbol = position['symbol']
+            had_position_last_cycle = True
 
     try:
         print_income_summary()
@@ -1676,11 +1736,15 @@ async def main_loop():
                             # Orders are old enough that they should be visible — truly missing
                             print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
                             cancel_all_open_orders(position['symbol'])
-                            place_emergency_sl_tp(position)
+                            success = place_emergency_sl_tp(position)
+                            if not success:
+                                force_close_position(position['symbol'], "SL/TP can't be placed")
                     else:
                         # No tracked orders — first time seeing this position without SL/TP
                         print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — placing...", flush=True)
-                        place_emergency_sl_tp(position)
+                        success = place_emergency_sl_tp(position)
+                        if not success:
+                            force_close_position(position['symbol'], "SL/TP can't be placed")
                 else:
                     print(f"   ⏳ SL/TP confirmed — waiting for trigger", flush=True)
 
