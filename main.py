@@ -1406,6 +1406,42 @@ async def execute_trade(decision, balance):
         tp_dist_pct = abs(tp - current_price) / current_price * 100
         actual_risk = actual_notional * abs(current_price - sl) / current_price
 
+        # === PREFLIGHT: Test if symbol supports stop orders BEFORE opening position ===
+        if symbol in _blacklisted_symbols:
+            print(f"   🚫 {symbol} is blacklisted — skipping", flush=True)
+            return False
+
+        try:
+            raw_sym = symbol_to_binance_raw(symbol)
+            # Try placing a stop order — -4120 triggers before any validation
+            dummy_side = 'SELL' if action == 'long' else 'BUY'
+            dummy_price = str(round_price(current_price * (0.5 if action == 'long' else 2.0), symbol))
+            dummy = trading_exchange.fapiprivate_post_order({
+                'symbol': raw_sym,
+                'side': dummy_side,
+                'type': 'STOP_MARKET',
+                'stopPrice': dummy_price,
+                'quantity': str(float(round_amount(position_notional / current_price, symbol))),
+                'reduceOnly': 'true',
+                'workingType': 'CONTRACT_PRICE',
+            })
+            # If it somehow succeeded, cancel immediately
+            dummy_id = dummy.get('orderId')
+            if dummy_id:
+                try:
+                    trading_exchange.fapiprivate_delete_order({'symbol': raw_sym, 'orderId': dummy_id})
+                except Exception:
+                    pass
+            print(f"   ✅ Stop-order preflight passed", flush=True)
+        except Exception as pf_err:
+            pf_str = str(pf_err)
+            if '-4120' in pf_str or 'Algo Order' in pf_str:
+                _blacklisted_symbols.add(symbol)
+                print(f"   🚫 {symbol} doesn't support stop orders — blacklisted, skipping", flush=True)
+                return False
+            # Other errors (no position to reduce, etc) are fine — means the order TYPE is supported
+            print(f"   ✅ Stop-order preflight passed (type supported)", flush=True)
+
         # Place entry order
         entry_side = "buy" if action == "long" else "sell"
         trading_exchange.create_market_order(symbol, entry_side, amount)
