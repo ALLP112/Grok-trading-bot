@@ -1,5 +1,5 @@
 """
-HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
+HIGH LEVERAGE TOP20 SCANNER — Grok 4.1 Thinking (Cross Margin)
 Enhanced with technical indicators, multi-timeframe analysis, order book data
 Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 20 coins by volume, strictly one position at a time
@@ -19,7 +19,7 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== HIGH LEVERAGE TOP100 SCANNER STARTING ===", flush=True)
+print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
 print("Grok 4.1 Thinking + Risk-Based Sizing + Cross Margin", flush=True)
 
 load_dotenv()
@@ -137,6 +137,12 @@ def normalize_symbol(symbol):
         return symbol
     clean = symbol.replace(':USDT', '').replace(':usdt', '').replace('/', '')
     markets = public_exchange.markets or {}
+    if not markets:
+        # Markets not loaded yet — try basic normalization
+        if clean.endswith('USDT'):
+            base = clean[:-4]
+            return f"{base}/USDT:USDT"
+        return symbol
     if clean in markets:
         return clean
     if clean.endswith('USDT'):
@@ -273,7 +279,7 @@ def calc_rsi(closes, period=14):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -602,10 +608,13 @@ def has_sl_tp_orders(symbol):
                     sl_check = trading_exchange.fapiprivate_get_order({
                         'symbol': raw_sym, 'orderId': _active_sl_tp['sl_id']
                     })
-                    sl_alive = sl_check.get('status', '') in ('NEW', 'PARTIALLY_FILLED')
-                except Exception:
-                    # Can't verify — trust placement age
-                    sl_alive = True
+                    sl_status = sl_check.get('status', '')
+                    sl_alive = sl_status in ('NEW', 'PARTIALLY_FILLED')
+                    if not sl_alive:
+                        print(f"   🔍 SL order {_active_sl_tp['sl_id']} status: {sl_status}", flush=True)
+                except Exception as sl_chk_err:
+                    # Can't verify — don't assume alive, let re-placement logic handle it
+                    print(f"   🔍 SL check failed: {sl_chk_err}", flush=True)
 
             # Check TP by ID (independent of SL result)
             if not tp_alive and _active_sl_tp.get('tp_id'):
@@ -614,10 +623,13 @@ def has_sl_tp_orders(symbol):
                     tp_check = trading_exchange.fapiprivate_get_order({
                         'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']
                     })
-                    tp_alive = tp_check.get('status', '') in ('NEW', 'PARTIALLY_FILLED')
-                except Exception:
-                    # Can't verify — trust placement age
-                    tp_alive = True
+                    tp_status = tp_check.get('status', '')
+                    tp_alive = tp_status in ('NEW', 'PARTIALLY_FILLED')
+                    if not tp_alive:
+                        print(f"   🔍 TP order {_active_sl_tp['tp_id']} status: {tp_status}", flush=True)
+                except Exception as tp_chk_err:
+                    # Can't verify — don't assume alive
+                    print(f"   🔍 TP check failed: {tp_chk_err}", flush=True)
 
             if sl_alive or tp_alive:
                 print(f"   🔍 Order tracking: SL={'✅' if sl_alive else '❌'} TP={'✅' if tp_alive else '❌'} (placed {age:.0f}s ago)", flush=True)
@@ -728,21 +740,32 @@ def place_emergency_sl_tp(position):
 
 
 def force_close_position(symbol, reason=""):
-    """Emergency close — market order to flatten position immediately."""
-    pos = get_open_position()
-    if not pos or pos['symbol'] != symbol:
-        return
-    close_side = 'sell' if pos['side'] == 'long' else 'buy'
-    try:
-        trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
-        print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
-        cancel_all_open_orders(symbol)
-        _active_sl_tp['symbol'] = None
-        _active_sl_tp['sl_id'] = None
-        _active_sl_tp['tp_id'] = None
-        _active_sl_tp['placed_at'] = 0
-    except Exception as e:
-        print(f"   💀 CRITICAL: Could not force-close {symbol}: {e}", flush=True)
+    """Emergency close — market order to flatten position immediately.
+    Retries up to 5 times because this is the LAST safety net."""
+    for attempt in range(5):
+        pos = get_open_position()
+        if not pos or pos['symbol'] != symbol:
+            # Position already gone — clean up tracking
+            _active_sl_tp['symbol'] = None
+            _active_sl_tp['sl_id'] = None
+            _active_sl_tp['tp_id'] = None
+            _active_sl_tp['placed_at'] = 0
+            return
+        close_side = 'sell' if pos['side'] == 'long' else 'buy'
+        try:
+            trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
+            print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
+            cancel_all_open_orders(symbol)
+            _active_sl_tp['symbol'] = None
+            _active_sl_tp['sl_id'] = None
+            _active_sl_tp['tp_id'] = None
+            _active_sl_tp['placed_at'] = 0
+            return
+        except Exception as e:
+            print(f"   💀 Force-close attempt {attempt + 1}/5 failed: {e}", flush=True)
+            if attempt < 4:
+                time.sleep(3)
+    print(f"   💀 CRITICAL: Could not force-close {symbol} after 5 attempts!", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -912,7 +935,7 @@ def calculate_position_size(balance, entry_price, sl_price, leverage):
 #  MARKET SCANNING
 # ============================================================
 
-async def get_top_candidates(n=100):
+async def get_top_candidates(n=20):
     get_cached_markets()
     tickers = None
     for attempt in range(3):
@@ -1002,8 +1025,8 @@ async def deep_enrich(candidates, top_n=10):
 
         try:
             # Funding rate (all coins)
-            funding = public_exchange.fetch_funding_rate(symbol).get('fundingRate', 0.0)
-            c['funding'] = funding
+            funding_data = public_exchange.fetch_funding_rate(symbol)
+            c['funding'] = funding_data.get('fundingRate', 0.0) if funding_data else 0.0
             await asyncio.sleep(0.3)
 
             # 15-minute candles (all coins)
@@ -1290,10 +1313,15 @@ Before picking a trade, think through each layer:
         normalized = normalize_symbol(raw_symbol)
         if normalized not in valid_symbols:
             raw_clean = symbol_to_binance_raw(raw_symbol)
+            found = False
             for vs in valid_symbols:
                 if symbol_to_binance_raw(vs) == raw_clean:
                     normalized = vs
+                    found = True
                     break
+            if not found:
+                print(f"   ⚠️ Grok returned unknown symbol '{raw_symbol}' — holding", flush=True)
+                return {"action": "hold", "confidence": 0, "reason": f"Unknown symbol: {raw_symbol}"}
         decision['symbol'] = normalized
         return decision
     except Exception as e:
@@ -1307,10 +1335,19 @@ Before picking a trade, think through each layer:
 
 async def execute_trade(decision, balance):
     action = decision.get("action", "hold")
-    confidence = decision.get("confidence", 0)
+    try:
+        confidence = float(decision.get("confidence", 0))
+    except (ValueError, TypeError):
+        confidence = 0
     symbol = decision.get("symbol")
-    sl = decision.get("stop_loss")
-    tp = decision.get("take_profit")
+    try:
+        sl = float(decision.get("stop_loss", 0)) or None
+    except (ValueError, TypeError):
+        sl = None
+    try:
+        tp = float(decision.get("take_profit", 0)) or None
+    except (ValueError, TypeError):
+        tp = None
 
     if action == "hold" or confidence < 0.74:
         print(f"   💤 HOLD — confidence {confidence:.2f} | {decision.get('reason', 'n/a')}", flush=True)
@@ -1337,29 +1374,59 @@ async def execute_trade(decision, balance):
             pass
 
         # Set leverage — auto-reduce if rejected
-        leverage = min(decision.get("leverage", 10), 20)
+        try:
+            leverage = min(int(decision.get("leverage", 10)), 20)
+        except (ValueError, TypeError):
+            leverage = 10
         # Deduplicate: put requested leverage first, then fallbacks
         lev_attempts = list(dict.fromkeys([leverage, 15, 10, 7, 5, 3, 2, 1]))
+        lev_set = False
         for lev in lev_attempts:
-            try:
-                trading_exchange.set_leverage(lev, symbol)
-                leverage = lev
+            for lev_retry in range(3):
+                try:
+                    trading_exchange.set_leverage(lev, symbol)
+                    leverage = lev
+                    lev_set = True
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if '-4028' in err_str and lev > 1:
+                        print(f"   ⚠️ {lev}x not supported for {symbol}, trying lower...", flush=True)
+                        break  # Try next lower leverage
+                    elif '-4028' in err_str and lev == 1:
+                        _blacklisted_symbols.add(symbol)
+                        print(f"   🚫 No valid leverage for {symbol} — blacklisted, skipping", flush=True)
+                        return False
+                    elif '-1000' in err_str and lev_retry < 2:
+                        print(f"   🔁 Transient error setting leverage — retrying in 3s", flush=True)
+                        await asyncio.sleep(3)
+                        continue
+                    else:
+                        raise
+            if lev_set:
                 break
-            except Exception as e:
-                if '-4028' in str(e) and lev > 1:
-                    print(f"   ⚠️ {lev}x not supported for {symbol}, trying lower...", flush=True)
-                    continue
-                elif '-4028' in str(e) and lev == 1:
-                    _blacklisted_symbols.add(symbol)
-                    print(f"   🚫 No valid leverage for {symbol} — blacklisted, skipping", flush=True)
-                    return False
-                else:
-                    raise
+        if not lev_set:
+            _blacklisted_symbols.add(symbol)
+            print(f"   🚫 Could not set any leverage for {symbol} — blacklisted, skipping", flush=True)
+            return False
         print(f"   ⚙️ Set leverage: {leverage}x", flush=True)
 
-        # Get current price
-        ticker = public_exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
+        # Get current price (with retry)
+        current_price = None
+        for tick_attempt in range(3):
+            try:
+                ticker = public_exchange.fetch_ticker(symbol)
+                current_price = ticker['last']
+                break
+            except Exception as tick_err:
+                if tick_attempt < 2:
+                    print(f"   🔁 Ticker fetch failed — retrying in 3s: {tick_err}", flush=True)
+                    await asyncio.sleep(3)
+                else:
+                    raise
+        if not current_price or current_price <= 0:
+            print(f"   ❌ Invalid price for {symbol} — skipping", flush=True)
+            return False
 
         # Validate SL/TP
         sl, tp = validate_sl_tp(action, current_price, sl, tp)
@@ -1431,7 +1498,7 @@ async def execute_trade(decision, balance):
                 'side': dummy_side,
                 'type': 'STOP_MARKET',
                 'stopPrice': dummy_price,
-                'quantity': str(float(round_amount(position_notional / current_price, symbol))),
+                'quantity': str(amount),
                 'reduceOnly': 'true',
                 'workingType': 'CONTRACT_PRICE',
             })
@@ -1452,9 +1519,18 @@ async def execute_trade(decision, balance):
             # Other errors (no position to reduce, etc) are fine — means the order TYPE is supported
             print(f"   ✅ Stop-order preflight passed (type supported)", flush=True)
 
-        # Place entry order
+        # Place entry order (with retry for transient -1000 errors)
         entry_side = "buy" if action == "long" else "sell"
-        trading_exchange.create_market_order(symbol, entry_side, amount)
+        for attempt in range(3):
+            try:
+                trading_exchange.create_market_order(symbol, entry_side, amount)
+                break
+            except Exception as entry_err:
+                if '-1000' in str(entry_err) and attempt < 2:
+                    print(f"   🔁 Transient error on entry order — retrying in 3s (attempt {attempt + 1}/3)", flush=True)
+                    await asyncio.sleep(3)
+                else:
+                    raise
 
         # Log the trade immediately (position IS open now regardless of SL/TP success)
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
@@ -1572,6 +1648,14 @@ async def execute_trade(decision, balance):
             pos = get_open_position()
             if pos and pos['symbol'] == symbol:
                 force_close_position(symbol, "Symbol doesn't support stop orders")
+        elif '-1000' in err_str:
+            print(f"   ⚠️ Binance transient error on {symbol} — will retry next cycle", flush=True)
+            # Check if market order went through but SL/TP failed
+            pos = get_open_position()
+            if pos and pos['symbol'] == symbol:
+                success = place_emergency_sl_tp(pos)
+                if not success:
+                    force_close_position(symbol, "Transient error left naked position")
         else:
             print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
             # Check if we have a naked position from a partial execution
@@ -1600,8 +1684,22 @@ async def scan_and_trade():
         print(f"   🔬 Enriching top 10 with technicals + order book...", flush=True)
         enriched = await deep_enrich(candidates, 10)
 
-        balance_data = trading_exchange.fetch_balance()
-        balance = float(balance_data['total'].get('USDT', 0))
+        balance = None
+        for bal_attempt in range(3):
+            try:
+                balance_data = trading_exchange.fetch_balance()
+                balance = float(balance_data['total'].get('USDT', 0))
+                break
+            except Exception as bal_err:
+                if bal_attempt < 2:
+                    print(f"   🔁 Balance fetch failed — retrying in 5s: {bal_err}", flush=True)
+                    await asyncio.sleep(5)
+                else:
+                    print(f"   ❌ Could not fetch balance after 3 attempts — skipping cycle", flush=True)
+                    return False
+        if balance is None or balance <= 0:
+            print(f"   ❌ Invalid balance (${balance}) — skipping cycle", flush=True)
+            return False
         print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
 
         if session_start_balance and session_start_balance > 0:
@@ -1618,6 +1716,9 @@ async def scan_and_trade():
 
     except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout, ccxt.NetworkError) as e:
         print(f"   🚫 Exchange error during scan — skipping this cycle: {str(e)[:80]}", flush=True)
+        return False
+    except ccxt.ExchangeError as e:
+        print(f"   ⚠️ Binance error during scan — skipping this cycle: {str(e)[:80]}", flush=True)
         return False
     except Exception as e:
         print(f"   ❌ Unexpected scan error: {e}", flush=True)
@@ -1682,7 +1783,7 @@ had_position_last_cycle = False
 async def main_loop():
     global last_position_symbol, had_position_last_cycle, session_start_balance
 
-    print("🚀 High Leverage Top100 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
+    print("🚀 High Leverage Top20 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
     print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Risk per trade: {MAX_RISK_PERCENT}% | Max margin: {MAX_MARGIN_PERCENT}%", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
@@ -1808,9 +1909,14 @@ async def main_loop():
                     else:
                         # Confirmed closed
                         print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
-                        handle_position_close(last_position_symbol)
+                        closed_sym = last_position_symbol
+                        # Reset state FIRST to prevent re-detection loop
                         last_position_symbol = None
                         had_position_last_cycle = False
+                        try:
+                            handle_position_close(closed_sym)
+                        except Exception as hpc_err:
+                            print(f"   ⚠️ Error in close handler: {hpc_err}", flush=True)
                         print_pnl_dashboard()
 
                         # Immediate rescan
