@@ -2,7 +2,7 @@
 HIGH LEVERAGE TOP100 SCANNER — Grok 4.1 Thinking (Cross Margin)
 Enhanced with technical indicators, multi-timeframe analysis, order book data
 Risk-based position sizing: size = risk_budget / SL_distance
-Scans top 100 coins, strictly one position at a time
+Scans top 20 coins by volume, strictly one position at a time
 Binance Demo Trading — runs 24/7 on Render.com
 """
 
@@ -1590,7 +1590,7 @@ async def execute_trade(decision, balance):
 
 async def scan_and_trade():
     try:
-        candidates = await get_top_candidates(100)
+        candidates = await get_top_candidates(20)
         print(f"   📈 Found {len(candidates)} futures", flush=True)
 
         if not candidates:
@@ -1823,7 +1823,7 @@ async def main_loop():
                                 last_position_symbol = pos['symbol']
 
                 else:
-                    print(f"\n[{now}] 🔍 No open position — scanning top 100 coins...", flush=True)
+                    print(f"\n[{now}] 🔍 No open position — scanning top 20 coins...", flush=True)
                     opened = await scan_and_trade()
                     if opened:
                         had_position_last_cycle = True
