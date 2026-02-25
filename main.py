@@ -1468,6 +1468,7 @@ async def execute_trade(decision, balance):
             trading_exchange.set_margin_mode('cross', symbol)
         except Exception:
             pass
+        await asyncio.sleep(1)  # Brief pause before leverage to avoid -1000
 
         # Set leverage — auto-reduce if rejected
         try:
@@ -1478,7 +1479,7 @@ async def execute_trade(decision, balance):
         lev_attempts = list(dict.fromkeys([leverage, 15, 10, 7, 5, 3, 2, 1]))
         lev_set = False
         for lev in lev_attempts:
-            for lev_retry in range(3):
+            for lev_retry in range(5):
                 try:
                     trading_exchange.set_leverage(lev, symbol)
                     leverage = lev
@@ -1493,10 +1494,15 @@ async def execute_trade(decision, balance):
                         _blacklisted_symbols.add(symbol)
                         print(f"   🚫 No valid leverage for {symbol} — blacklisted, skipping", flush=True)
                         return False
-                    elif '-1000' in err_str and lev_retry < 2:
-                        print(f"   🔁 Transient error setting leverage — retrying in 3s", flush=True)
-                        await asyncio.sleep(3)
+                    elif '-1000' in err_str and lev_retry < 4:
+                        wait = 5 * (lev_retry + 1)  # 5s, 10s, 15s, 20s
+                        print(f"   🔁 Transient error setting leverage — retrying in {wait}s ({lev_retry + 1}/5)", flush=True)
+                        await asyncio.sleep(wait)
                         continue
+                    elif '-1000' in err_str:
+                        # Exhausted retries on -1000 — don't raise, just skip this trade
+                        print(f"   ⚠️ Persistent -1000 on leverage — skipping trade this cycle", flush=True)
+                        return False
                     else:
                         raise
             if lev_set:
@@ -1586,14 +1592,18 @@ async def execute_trade(decision, balance):
 
         # Place entry order (with retry for transient -1000 errors)
         entry_side = "buy" if action == "long" else "sell"
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 trading_exchange.create_market_order(symbol, entry_side, amount)
                 break
             except Exception as entry_err:
-                if '-1000' in str(entry_err) and attempt < 2:
-                    print(f"   🔁 Transient error on entry order — retrying in 3s (attempt {attempt + 1}/3)", flush=True)
-                    await asyncio.sleep(3)
+                if '-1000' in str(entry_err) and attempt < 4:
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s, 20s
+                    print(f"   🔁 Transient error on entry order — retrying in {wait}s ({attempt + 1}/5)", flush=True)
+                    await asyncio.sleep(wait)
+                elif '-1000' in str(entry_err):
+                    print(f"   ⚠️ Persistent -1000 on entry — skipping trade this cycle", flush=True)
+                    return False
                 else:
                     raise
 
