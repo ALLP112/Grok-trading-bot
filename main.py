@@ -932,6 +932,10 @@ async def get_top_candidates(n=100):
     TRADFI_BASES = {'XAG', 'XAU', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'XPT', 'XPD',
                     'USO', 'SPX', 'NDX', 'DJI', 'VIX', 'NAS', 'RUS'}
 
+    # Innovation zone tokens that don't support stop orders or leverage on demo
+    INNOVATION_BASES = {'ESP', 'ENSO'}
+    SKIP_BASES = TRADFI_BASES | INNOVATION_BASES
+
     markets = public_exchange.markets or {}
     candidates = []
     for symbol, ticker in tickers.items():
@@ -939,9 +943,9 @@ async def get_top_candidates(n=100):
         if ('USDT' in symbol
                 and market.get('swap', False)
                 and market.get('active', True)):
-            # Skip TradFi perps
+            # Skip TradFi and innovation zone tokens
             base = market.get('base', '')
-            if base in TRADFI_BASES:
+            if base in SKIP_BASES:
                 continue
             # Skip symbols that previously failed SL/TP placement
             if symbol in _blacklisted_symbols:
@@ -1334,7 +1338,9 @@ async def execute_trade(decision, balance):
 
         # Set leverage — auto-reduce if rejected
         leverage = min(decision.get("leverage", 10), 20)
-        for lev in [leverage, 15, 10, 7, 5, 3, 2, 1]:
+        # Deduplicate: put requested leverage first, then fallbacks
+        lev_attempts = list(dict.fromkeys([leverage, 15, 10, 7, 5, 3, 2, 1]))
+        for lev in lev_attempts:
             try:
                 trading_exchange.set_leverage(lev, symbol)
                 leverage = lev
@@ -1344,7 +1350,8 @@ async def execute_trade(decision, balance):
                     print(f"   ⚠️ {lev}x not supported for {symbol}, trying lower...", flush=True)
                     continue
                 elif '-4028' in str(e) and lev == 1:
-                    print(f"   ❌ No valid leverage for {symbol} — skipping", flush=True)
+                    _blacklisted_symbols.add(symbol)
+                    print(f"   🚫 No valid leverage for {symbol} — blacklisted, skipping", flush=True)
                     return False
                 else:
                     raise
