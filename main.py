@@ -1334,15 +1334,18 @@ async def execute_trade(decision, balance):
 
         # Set leverage — auto-reduce if rejected
         leverage = min(decision.get("leverage", 10), 20)
-        for lev in [leverage, 15, 10, 7, 5, 3]:
+        for lev in [leverage, 15, 10, 7, 5, 3, 2, 1]:
             try:
                 trading_exchange.set_leverage(lev, symbol)
                 leverage = lev
                 break
             except Exception as e:
-                if '-4028' in str(e) and lev > 3:
+                if '-4028' in str(e) and lev > 1:
                     print(f"   ⚠️ {lev}x not supported for {symbol}, trying lower...", flush=True)
                     continue
+                elif '-4028' in str(e) and lev == 1:
+                    print(f"   ❌ No valid leverage for {symbol} — skipping", flush=True)
+                    return False
                 else:
                     raise
         print(f"   ⚙️ Set leverage: {leverage}x", flush=True)
