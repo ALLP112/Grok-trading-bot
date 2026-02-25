@@ -1309,6 +1309,9 @@ Before picking a trade, think through each layer:
             print(f"   ⚠️ Could not parse Grok JSON — holding", flush=True)
             print(f"   [RAW]: {text[:200]}", flush=True)
             return {"action": "hold", "confidence": 0, "reason": "JSON parse failure"}
+        # If Grok says hold, skip symbol validation entirely
+        if decision.get('action', '').lower() == 'hold':
+            return decision
         raw_symbol = decision.get('symbol', '')
         normalized = normalize_symbol(raw_symbol)
         if normalized not in valid_symbols:
