@@ -69,9 +69,6 @@ print("✅ Connected to Binance DEMO for trading (cross margin)", flush=True)
 # Runtime blacklist — symbols where SL/TP placement fails on ALL endpoints
 _blacklisted_symbols = set()
 
-# Symbols that need the conditional order endpoint (auto-detected on -4120)
-_conditional_endpoint_symbols = set()
-
 
 # ============================================================
 #  MARKET CACHE
@@ -591,29 +588,9 @@ def has_sl_tp_orders(symbol):
         except Exception as e2:
             print(f"   🔍 Raw endpoint failed: {e2}", flush=True)
 
-    # Method 2b: conditional order endpoint (for symbols using algo/conditional API)
-    if (not has_sl or not has_tp) and (
-            symbol_to_binance_raw(symbol) in _conditional_endpoint_symbols or
-            _active_sl_tp.get('endpoint') == 'conditional'):
-        try:
-            raw_sym = symbol_to_binance_raw(symbol)
-            method = getattr(trading_exchange, 'fapiprivate_get_conditional_openorders', None)
-            if method:
-                cond_orders = method({'symbol': raw_sym})
-            else:
-                cond_orders = trading_exchange.request('conditional/openOrders', 'fapiPrivate', 'GET',
-                                                       {'symbol': raw_sym})
-            for co in (cond_orders or []):
-                co_type = (co.get('type', co.get('strategyType', '')) or '').upper()
-                co_status = (co.get('strategyStatus', co.get('status', '')) or '').upper()
-                if co_status in ('NEW', 'ACTIVE', 'PENDING'):
-                    if 'STOP' in co_type and 'PROFIT' not in co_type:
-                        has_sl = True
-                    if 'TAKE_PROFIT' in co_type or 'PROFIT' in co_type:
-                        has_tp = True
-        except Exception as e_cond:
-            # Conditional endpoint may not exist — that's OK
-            pass
+    # If software stop is active, consider position protected
+    if _active_sl_tp.get('software_stop') and _active_sl_tp.get('symbol') == symbol:
+        return True, True, all_orders
 
     if not has_sl or not has_tp:
         raw_sym = symbol_to_binance_raw(symbol)
@@ -663,15 +640,33 @@ _active_sl_tp = {
     'symbol': None,
     'sl_id': None,
     'tp_id': None,
-    'endpoint': 'standard',  # 'standard' or 'conditional'
+    'endpoint': 'standard',
     'placed_at': 0,
+    # Software stop-loss: if exchange orders can't be placed, bot monitors price
+    'software_stop': False,
+    'sl_price': None,
+    'tp_price': None,
+    'position_side': None,  # 'long' or 'short'
 }
 
 
+def reset_sl_tp_tracking():
+    """Reset all SL/TP tracking to defaults."""
+    _active_sl_tp['symbol'] = None
+    _active_sl_tp['sl_id'] = None
+    _active_sl_tp['tp_id'] = None
+    _active_sl_tp['endpoint'] = 'standard'
+    _active_sl_tp['placed_at'] = 0
+    _active_sl_tp['software_stop'] = False
+    _active_sl_tp['sl_price'] = None
+    _active_sl_tp['tp_price'] = None
+    _active_sl_tp['position_side'] = None
+
+
 def place_stop_order(raw_sym, side, order_type, stop_price, close_position=True):
-    """Place a STOP_MARKET or TAKE_PROFIT_MARKET order with automatic endpoint fallback.
-    Tries /fapi/v1/order first, falls back to /fapi/v1/conditional/order on -4120.
-    Returns (order_id, endpoint_type) or raises on failure."""
+    """Place a STOP_MARKET or TAKE_PROFIT_MARKET order.
+    Tries standard endpoint. Returns (order_id, 'standard') on success.
+    Raises on failure — caller should fall back to software stop."""
 
     params = {
         'symbol': raw_sym,
@@ -683,107 +678,94 @@ def place_stop_order(raw_sym, side, order_type, stop_price, close_position=True)
     if close_position:
         params['closePosition'] = 'true'
 
-    # If we already know this symbol needs conditional endpoint, skip standard
-    if raw_sym not in _conditional_endpoint_symbols:
-        try:
-            result = trading_exchange.fapiprivate_post_order(params)
-            order_id = str(result.get('orderId', 'unknown'))
-            return order_id, 'standard'
-        except Exception as e:
-            if '-4120' not in str(e):
-                raise  # Non-4120 error — don't try fallback
-            print(f"   🔄 Standard endpoint rejected (-4120) — trying conditional endpoint...", flush=True)
-            _conditional_endpoint_symbols.add(raw_sym)
-
-    # Fallback: conditional order endpoint
-    try:
-        result = trading_exchange.fapiprivate_post_conditional_order(params)
-        order_id = str(result.get('strategyId', result.get('orderId', 'unknown')))
-        return order_id, 'conditional'
-    except AttributeError:
-        # ccxt doesn't have this method — try direct request
-        try:
-            result = trading_exchange.request('conditional/order', 'fapiPrivate', 'POST', params)
-            order_id = str(result.get('strategyId', result.get('orderId', 'unknown')))
-            return order_id, 'conditional'
-        except Exception as e3:
-            raise Exception(f"Both standard and conditional endpoints failed. Last error: {e3}")
-    except Exception as e2:
-        raise Exception(f"Conditional endpoint failed: {e2}")
-
-
-def cancel_conditional_orders(raw_sym):
-    """Cancel all conditional orders for a symbol. Safe to call even if none exist."""
-    cancelled = 0
-    # Try dedicated conditional endpoints
-    for method_name, fallback_path in [
-        ('fapiprivate_delete_conditional_allopenorders', 'conditional/allOpenOrders'),
-    ]:
-        try:
-            method = getattr(trading_exchange, method_name, None)
-            if method:
-                method({'symbol': raw_sym})
-            else:
-                trading_exchange.request(fallback_path, 'fapiPrivate', 'DELETE', {'symbol': raw_sym})
-            cancelled += 1
-            break
-        except Exception:
-            pass
-
-    # Also try listing and cancelling individually
-    try:
-        method = getattr(trading_exchange, 'fapiprivate_get_conditional_openorders', None)
-        if method:
-            orders = method({'symbol': raw_sym})
-        else:
-            orders = trading_exchange.request('conditional/openOrders', 'fapiPrivate', 'GET', {'symbol': raw_sym})
-        for o in (orders or []):
-            strategy_id = o.get('strategyId', o.get('orderId'))
-            if strategy_id:
-                try:
-                    del_method = getattr(trading_exchange, 'fapiprivate_delete_conditional_order', None)
-                    if del_method:
-                        del_method({'symbol': raw_sym, 'strategyId': strategy_id})
-                    else:
-                        trading_exchange.request('conditional/order', 'fapiPrivate', 'DELETE',
-                                                 {'symbol': raw_sym, 'strategyId': strategy_id})
-                    cancelled += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    return cancelled
+    result = trading_exchange.fapiprivate_post_order(params)
+    order_id = str(result.get('orderId', 'unknown'))
+    return order_id, 'standard'
 
 
 def verify_stop_order(raw_sym, order_id, endpoint_type='standard'):
     """Verify a stop order exists and is active. Returns status string or '?'."""
     try:
-        if endpoint_type == 'standard':
-            check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': order_id})
-            return check.get('status', '?')
-        else:
-            # Conditional orders — try listing open ones and finding by ID
-            try:
-                method = getattr(trading_exchange, 'fapiprivate_get_conditional_openorders', None)
-                if method:
-                    orders = method({'symbol': raw_sym})
-                else:
-                    orders = trading_exchange.request('conditional/openOrders', 'fapiPrivate', 'GET',
-                                                      {'symbol': raw_sym})
-                for o in (orders or []):
-                    if str(o.get('strategyId', '')) == order_id or str(o.get('orderId', '')) == order_id:
-                        return o.get('strategyStatus', o.get('status', 'NEW'))
-                return 'NOT_FOUND'
-            except Exception:
-                # Can't verify conditional orders — assume alive if recently placed
-                return 'ASSUMED_ALIVE'
+        check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': order_id})
+        return check.get('status', '?')
     except Exception as e:
         return f'ERROR:{e}'
 
 
+def activate_software_stop(symbol, side, sl, tp):
+    """Activate software stop-loss when exchange orders can't be placed.
+    Bot will monitor price every cycle and market-close on breach."""
+    _active_sl_tp['symbol'] = symbol
+    _active_sl_tp['sl_id'] = None
+    _active_sl_tp['tp_id'] = None
+    _active_sl_tp['endpoint'] = 'software'
+    _active_sl_tp['placed_at'] = time.time()
+    _active_sl_tp['software_stop'] = True
+    _active_sl_tp['sl_price'] = sl
+    _active_sl_tp['tp_price'] = tp
+    _active_sl_tp['position_side'] = side
+    print(f"   🛡️ SOFTWARE STOP ACTIVE on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
+    print(f"   ⚠️ Bot will monitor price each cycle and market-close on breach", flush=True)
+
+
+def check_software_stop(position):
+    """Check if software stop-loss should trigger. Returns True if position was closed."""
+    if not _active_sl_tp.get('software_stop'):
+        return False
+    if _active_sl_tp.get('symbol') != position['symbol']:
+        return False
+
+    sl = _active_sl_tp.get('sl_price')
+    tp = _active_sl_tp.get('tp_price')
+    side = _active_sl_tp.get('position_side')
+    if not sl or not tp or not side:
+        return False
+
+    # Get current price
+    try:
+        ticker = public_exchange.fetch_ticker(position['symbol'])
+        current = ticker['last']
+    except Exception as e:
+        print(f"   ⚠️ Software stop: can't fetch price: {e}", flush=True)
+        return False
+
+    triggered = False
+    trigger_reason = ""
+
+    if side == 'long':
+        if current <= sl:
+            triggered = True
+            trigger_reason = f"SL hit (price ${current:,.2f} <= SL ${sl:,.2f})"
+        elif current >= tp:
+            triggered = True
+            trigger_reason = f"TP hit (price ${current:,.2f} >= TP ${tp:,.2f})"
+    else:  # short
+        if current >= sl:
+            triggered = True
+            trigger_reason = f"SL hit (price ${current:,.2f} >= SL ${sl:,.2f})"
+        elif current <= tp:
+            triggered = True
+            trigger_reason = f"TP hit (price ${current:,.2f} <= TP ${tp:,.2f})"
+
+    if triggered:
+        print(f"   🛡️ SOFTWARE STOP TRIGGERED: {trigger_reason}", flush=True)
+        force_close_position(position['symbol'], f"Software stop: {trigger_reason}")
+        return True
+
+    # Log status
+    if side == 'long':
+        sl_dist = (current - sl) / current * 100
+        tp_dist = (tp - current) / current * 100
+    else:
+        sl_dist = (sl - current) / current * 100
+        tp_dist = (current - tp) / current * 100
+    print(f"   🛡️ Software stop: price ${current:,.2f} | SL {sl_dist:.1f}% away | TP {tp_dist:.1f}% away", flush=True)
+    return False
+
+
 def place_emergency_sl_tp(position):
-    """Place emergency SL/TP. Returns True if successful, False if failed."""
+    """Place emergency SL/TP. Tries exchange orders first, falls back to software stop.
+    ALWAYS returns True — positions are always protected one way or another."""
     symbol = position['symbol']
     side = position['side']
     entry = position['entry_price']
@@ -798,7 +780,7 @@ def place_emergency_sl_tp(position):
     current_pos = get_open_position()
     if not current_pos or current_pos['symbol'] != symbol:
         print(f"   ⚠️ Position no longer exists — skipping emergency SL/TP", flush=True)
-        return False
+        return True  # No position = no protection needed
 
     contracts = current_pos['contracts']
     side = current_pos['side']  # Use re-verified side
@@ -818,39 +800,42 @@ def place_emergency_sl_tp(position):
     raw_sym = symbol_to_binance_raw(symbol)
     print(f"   📋 Placing emergency orders: side={order_side} closePosition SL=${sl:,.2f} TP=${tp:,.2f}", flush=True)
 
+    # Try exchange-side stop orders
     try:
         sl_id, sl_endpoint = place_stop_order(raw_sym, order_side, 'STOP_MARKET', sl)
-        print(f"   ✅ SL order placed: {sl_id} (via {sl_endpoint})", flush=True)
+        print(f"   ✅ SL order placed: {sl_id}", flush=True)
 
         tp_id, tp_endpoint = place_stop_order(raw_sym, order_side, 'TAKE_PROFIT_MARKET', tp)
-        print(f"   ✅ TP order placed: {tp_id} (via {tp_endpoint})", flush=True)
-
-        # Use whichever endpoint was used (they should be the same)
-        endpoint = tp_endpoint
+        print(f"   ✅ TP order placed: {tp_id}", flush=True)
 
         # Immediate verification
         time.sleep(2)
         try:
-            sl_status = verify_stop_order(raw_sym, sl_id, endpoint)
+            sl_status = verify_stop_order(raw_sym, sl_id)
             print(f"   🔍 SL verify: status={sl_status}", flush=True)
-            tp_status = verify_stop_order(raw_sym, tp_id, endpoint)
+            tp_status = verify_stop_order(raw_sym, tp_id)
             print(f"   🔍 TP verify: status={tp_status}", flush=True)
         except Exception as ve:
             print(f"   🔍 Verify: {ve}", flush=True)
 
         print(f"   🚨 Emergency SL/TP placed on {symbol}: SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
 
-        # Track order IDs
         _active_sl_tp['symbol'] = symbol
         _active_sl_tp['sl_id'] = sl_id
         _active_sl_tp['tp_id'] = tp_id
-        _active_sl_tp['endpoint'] = endpoint
+        _active_sl_tp['endpoint'] = 'standard'
         _active_sl_tp['placed_at'] = time.time()
+        _active_sl_tp['software_stop'] = False
+        _active_sl_tp['sl_price'] = sl
+        _active_sl_tp['tp_price'] = tp
+        _active_sl_tp['position_side'] = side
         return True
 
     except Exception as e:
-        print(f"   ❌ Failed to place emergency SL/TP: {e}", flush=True)
-        return False
+        print(f"   ⚠️ Exchange stop orders failed: {e}", flush=True)
+        print(f"   🛡️ Falling back to SOFTWARE STOP-LOSS...", flush=True)
+        activate_software_stop(symbol, side, sl, tp)
+        return True  # Software stop is active — position IS protected
 
 
 def force_close_position(symbol, reason=""):
@@ -860,22 +845,14 @@ def force_close_position(symbol, reason=""):
         pos = get_open_position()
         if not pos or pos['symbol'] != symbol:
             # Position already gone — clean up tracking
-            _active_sl_tp['symbol'] = None
-            _active_sl_tp['sl_id'] = None
-            _active_sl_tp['tp_id'] = None
-            _active_sl_tp['placed_at'] = 0
-            _active_sl_tp['endpoint'] = 'standard'
+            reset_sl_tp_tracking()
             return
         close_side = 'sell' if pos['side'] == 'long' else 'buy'
         try:
             trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
             print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
             cancel_all_open_orders(symbol)
-            _active_sl_tp['symbol'] = None
-            _active_sl_tp['sl_id'] = None
-            _active_sl_tp['tp_id'] = None
-            _active_sl_tp['placed_at'] = 0
-            _active_sl_tp['endpoint'] = 'standard'
+            reset_sl_tp_tracking()
             return
         except Exception as e:
             print(f"   💀 Force-close attempt {attempt + 1}/5 failed: {e}", flush=True)
@@ -927,13 +904,6 @@ def cancel_all_open_orders(symbol):
             pass
     elif cancelled > 0:
         print(f"   🧹 Cancelled {cancelled} orders on {symbol}", flush=True)
-
-    # Method 4: Cancel conditional orders (for symbols using the conditional endpoint)
-    raw_sym = symbol_to_binance_raw(symbol)
-    if raw_sym in _conditional_endpoint_symbols or _active_sl_tp.get('endpoint') == 'conditional':
-        cond_cancelled = cancel_conditional_orders(raw_sym)
-        if cond_cancelled:
-            print(f"   🧹 Cancelled {cond_cancelled} conditional orders on {symbol}", flush=True)
 
 
 def cleanup_all_orders():
@@ -1631,32 +1601,33 @@ async def execute_trade(decision, balance):
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
                        confidence, decision.get('reason', ''), actual_margin, actual_risk)
 
-        # Place SL/TP via centralized helper (auto-fallback to conditional endpoint)
+        # Place SL/TP via exchange stop orders (falls back to software stop if needed)
         raw_sym = symbol_to_binance_raw(symbol)
         sl_side = "SELL" if action == "long" else "BUY"
         sl_id = None
         tp_id = None
-        endpoint = 'standard'
 
         try:
-            sl_id, endpoint = place_stop_order(raw_sym, sl_side, 'STOP_MARKET', sl)
-            print(f"   ✅ SL order placed: {sl_id} ({sl_side} @ ${sl:,.2f}) via {endpoint}", flush=True)
+            sl_id, _ = place_stop_order(raw_sym, sl_side, 'STOP_MARKET', sl)
+            print(f"   ✅ SL order placed: {sl_id} ({sl_side} @ ${sl:,.2f})", flush=True)
         except Exception as sl_err:
-            print(f"   ❌ SL placement failed: {sl_err}", flush=True)
+            print(f"   ⚠️ SL placement failed: {sl_err}", flush=True)
 
         try:
-            tp_id, tp_ep = place_stop_order(raw_sym, sl_side, 'TAKE_PROFIT_MARKET', tp)
-            endpoint = tp_ep  # Use the most recent endpoint type
-            print(f"   ✅ TP order placed: {tp_id} ({sl_side} @ ${tp:,.2f}) via {endpoint}", flush=True)
+            tp_id, _ = place_stop_order(raw_sym, sl_side, 'TAKE_PROFIT_MARKET', tp)
+            print(f"   ✅ TP order placed: {tp_id} ({sl_side} @ ${tp:,.2f})", flush=True)
         except Exception as tp_err:
-            print(f"   ❌ TP placement failed: {tp_err}", flush=True)
+            print(f"   ⚠️ TP placement failed: {tp_err}", flush=True)
 
-        # Track order IDs (even if one failed — we track what we have)
+        # Track order IDs and price levels
         _active_sl_tp['symbol'] = symbol
         _active_sl_tp['sl_id'] = sl_id
         _active_sl_tp['tp_id'] = tp_id
-        _active_sl_tp['endpoint'] = endpoint
+        _active_sl_tp['endpoint'] = 'standard'
         _active_sl_tp['placed_at'] = time.time()
+        _active_sl_tp['sl_price'] = sl
+        _active_sl_tp['tp_price'] = tp
+        _active_sl_tp['position_side'] = action
 
         # R:R ratio
         if action == "long":
@@ -1672,48 +1643,38 @@ async def execute_trade(decision, balance):
         print(f"   🛑 SL: ${sl:,.2f} (-{sl_dist_pct:.1f}%) | 🎯 TP: ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
-        # If either SL or TP failed to place, immediately try emergency
+        # If either SL or TP failed to place, fall back to emergency (which uses software stop)
         if not sl_id or sl_id == 'unknown' or not tp_id or tp_id == 'unknown':
             print(f"   🚨 SL/TP incomplete — attempting emergency placement...", flush=True)
             cancel_all_open_orders(symbol)
-            _active_sl_tp['sl_id'] = None
-            _active_sl_tp['tp_id'] = None
             pos = get_open_position()
             if pos:
-                success = place_emergency_sl_tp(pos)
-                if not success:
-                    # CANNOT protect this position — close it immediately
-                    force_close_position(symbol, "SL/TP not supported on this symbol")
-                    return False
+                place_emergency_sl_tp(pos)  # Always succeeds (software stop fallback)
         else:
             # Both orders returned IDs — verify they actually stuck
             await asyncio.sleep(3)
             try:
-                sl_status = verify_stop_order(raw_sym, sl_id, endpoint)
+                sl_status = verify_stop_order(raw_sym, sl_id)
                 print(f"   🔍 SL verify: status={sl_status}", flush=True)
 
-                tp_status = verify_stop_order(raw_sym, tp_id, endpoint)
+                tp_status = verify_stop_order(raw_sym, tp_id)
                 print(f"   🔍 TP verify: status={tp_status}", flush=True)
 
-                # For conditional orders, accept ASSUMED_ALIVE and NEW-like statuses
-                sl_ok = sl_status in ('NEW', 'PARTIALLY_FILLED', 'ASSUMED_ALIVE', 'NEW_')
-                tp_ok = tp_status in ('NEW', 'PARTIALLY_FILLED', 'ASSUMED_ALIVE', 'NEW_')
+                sl_ok = sl_status in ('NEW', 'PARTIALLY_FILLED')
+                tp_ok = tp_status in ('NEW', 'PARTIALLY_FILLED')
 
                 if not sl_ok or not tp_ok:
                     print(f"   🚨 Orders may not be active — emergency re-place...", flush=True)
                     cancel_all_open_orders(symbol)
-                    _active_sl_tp['sl_id'] = None
-                    _active_sl_tp['tp_id'] = None
-                    _active_sl_tp['symbol'] = None
+                    reset_sl_tp_tracking()
                     pos = get_open_position()
                     if pos:
-                        success = place_emergency_sl_tp(pos)
-                        if not success:
-                            force_close_position(symbol, "SL/TP orders auto-cancelled and can't be re-placed")
-                            return False
+                        place_emergency_sl_tp(pos)  # Always succeeds
             except Exception as ve:
                 # Can't verify — trust the placement (IDs were returned)
-                print(f"   🔍 Verification unavailable ({ve}) — trusting order IDs", flush=True)
+                # Also store software stop as backup
+                _active_sl_tp['software_stop'] = True
+                print(f"   🔍 Verification unavailable ({ve}) — software stop active as backup", flush=True)
 
         return True
 
@@ -1721,32 +1682,15 @@ async def execute_trade(decision, balance):
         err_str = str(e)
         if '-4411' in err_str or 'TradFi' in err_str:
             print(f"   ⚠️ {symbol} requires TradFi agreement — skipping", flush=True)
-        elif '-4120' in err_str or 'Algo Order' in err_str:
-            print(f"   ⚠️ {symbol} hit -4120 — attempting emergency SL/TP via conditional endpoint...", flush=True)
-            pos = get_open_position()
-            if pos and pos['symbol'] == symbol:
-                success = place_emergency_sl_tp(pos)
-                if not success:
-                    _blacklisted_symbols.add(symbol)
-                    print(f"   🚫 {symbol} blacklisted — neither endpoint supports stop orders", flush=True)
-                    force_close_position(symbol, "No working stop order endpoint")
         elif '-1000' in err_str:
             print(f"   ⚠️ Binance transient error on {symbol} — will retry next cycle", flush=True)
-            # Check if market order went through but SL/TP failed
-            pos = get_open_position()
-            if pos and pos['symbol'] == symbol:
-                success = place_emergency_sl_tp(pos)
-                if not success:
-                    force_close_position(symbol, "Transient error left naked position")
         else:
             print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
-            # Check if we have a naked position from a partial execution
+        # For any error, check if we have a naked position and protect it
+        if '-4411' not in err_str:
             pos = get_open_position()
             if pos and pos['symbol'] == symbol:
-                # Try emergency SL/TP
-                success = place_emergency_sl_tp(pos)
-                if not success:
-                    force_close_position(symbol, "Can't protect position after execution error")
+                place_emergency_sl_tp(pos)  # Always succeeds (software stop fallback)
         return False
 
 
@@ -1849,11 +1793,7 @@ def handle_position_close(symbol):
     cancel_all_open_orders(symbol)
 
     # Clear order tracking
-    _active_sl_tp['symbol'] = None
-    _active_sl_tp['sl_id'] = None
-    _active_sl_tp['tp_id'] = None
-    _active_sl_tp['placed_at'] = 0
-    _active_sl_tp['endpoint'] = 'standard'
+    reset_sl_tp_tracking()
 
 
 # ============================================================
@@ -1951,32 +1891,34 @@ async def main_loop():
                       f"Contracts: {position['contracts']} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
 
-                # Verify SL/TP orders still exist
-                has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
-                if not has_sl or not has_tp:
-                    # Check if we recently placed orders — don't re-place too aggressively
-                    if (_active_sl_tp.get('symbol') == position['symbol'] and
-                            _active_sl_tp.get('sl_id') and _active_sl_tp.get('tp_id')):
-                        age = time.time() - _active_sl_tp.get('placed_at', 0)
-                        if age < INTERVAL_MINUTES * 60 * 2:
-                            # We placed orders recently — they might exist but fetch can't see them
-                            # Don't cancel and re-place (that's what causes the loop!)
-                            print(f"   ⚠️ fetch_open_orders can't see SL/TP, but we placed them {age:.0f}s ago — skipping re-place", flush=True)
-                        else:
-                            # Orders are old enough that they should be visible — truly missing
-                            print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
-                            cancel_all_open_orders(position['symbol'])
-                            success = place_emergency_sl_tp(position)
-                            if not success:
-                                force_close_position(position['symbol'], "SL/TP can't be placed")
-                    else:
-                        # No tracked orders — first time seeing this position without SL/TP
-                        print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — placing...", flush=True)
-                        success = place_emergency_sl_tp(position)
-                        if not success:
-                            force_close_position(position['symbol'], "SL/TP can't be placed")
+                # === SOFTWARE STOP CHECK (highest priority — runs every cycle) ===
+                if check_software_stop(position):
+                    # Position was closed by software stop
+                    continue
+
+                # === If software stop is active, skip order verification ===
+                if _active_sl_tp.get('software_stop') and _active_sl_tp.get('symbol') == position['symbol']:
+                    # Software stop already logging its status in check_software_stop above
+                    pass
                 else:
-                    print(f"   ⏳ SL/TP confirmed — waiting for trigger", flush=True)
+                    # Verify exchange SL/TP orders still exist
+                    has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
+                    if not has_sl or not has_tp:
+                        # Check if we recently placed orders — don't re-place too aggressively
+                        if (_active_sl_tp.get('symbol') == position['symbol'] and
+                                _active_sl_tp.get('sl_id') and _active_sl_tp.get('tp_id')):
+                            age = time.time() - _active_sl_tp.get('placed_at', 0)
+                            if age < INTERVAL_MINUTES * 60 * 2:
+                                print(f"   ⚠️ fetch_open_orders can't see SL/TP, but we placed them {age:.0f}s ago — skipping re-place", flush=True)
+                            else:
+                                print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
+                                cancel_all_open_orders(position['symbol'])
+                                place_emergency_sl_tp(position)
+                        else:
+                            print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — placing...", flush=True)
+                            place_emergency_sl_tp(position)
+                    else:
+                        print(f"   ⏳ SL/TP confirmed — waiting for trigger", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
@@ -2046,7 +1988,26 @@ async def main_loop():
             print(f"   ❌ Loop error: {e}", flush=True)
             traceback.print_exc()
 
-        await asyncio.sleep(INTERVAL_MINUTES * 60)
+        # Adaptive sleep: check software stops every 30s, otherwise full interval
+        if _active_sl_tp.get('software_stop'):
+            total_wait = INTERVAL_MINUTES * 60
+            elapsed = 0
+            while elapsed < total_wait:
+                await asyncio.sleep(30)
+                elapsed += 30
+                # Quick software stop check
+                pos = get_open_position()
+                if pos and _active_sl_tp.get('software_stop'):
+                    if check_software_stop(pos):
+                        # Position closed by software stop — break out to scan
+                        had_position_last_cycle = False
+                        last_position_symbol = None
+                        break
+                elif not pos and had_position_last_cycle:
+                    # Position closed (by SL/TP trigger or liquidation)
+                    break
+        else:
+            await asyncio.sleep(INTERVAL_MINUTES * 60)
 
 
 # Crash-proof wrapper — restart on unexpected death
