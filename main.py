@@ -844,13 +844,30 @@ def force_close_position(symbol, reason=""):
     for attempt in range(5):
         pos = get_open_position()
         if not pos or pos['symbol'] != symbol:
-            # Position already gone — clean up tracking
+            # Position already gone — clean up tracking and log
             reset_sl_tp_tracking()
+            _close_stale_trade_log(symbol)
             return
         close_side = 'sell' if pos['side'] == 'long' else 'buy'
         try:
+            exit_price = pos.get('entry_price', 0)
             trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
             print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
+            # Log the close with realized PnL
+            try:
+                raw_sym = symbol_to_binance_raw(symbol)
+                incomes = trading_exchange.fapiprivate_get_income({
+                    'symbol': raw_sym, 'incomeType': 'REALIZED_PNL', 'limit': 1,
+                })
+                realized_pnl = float(incomes[-1].get('income', 0)) if incomes else 0
+                try:
+                    trades = trading_exchange.fetch_my_trades(symbol, limit=1)
+                    exit_price = float(trades[-1]['price']) if trades else exit_price
+                except Exception:
+                    pass
+                log_trade_close(exit_price, realized_pnl)
+            except Exception:
+                log_trade_close(exit_price, 0)
             cancel_all_open_orders(symbol)
             reset_sl_tp_tracking()
             return
@@ -859,6 +876,21 @@ def force_close_position(symbol, reason=""):
             if attempt < 4:
                 time.sleep(3)
     print(f"   💀 CRITICAL: Could not force-close {symbol} after 5 attempts!", flush=True)
+
+
+def _close_stale_trade_log(symbol=None):
+    """Close any open entries in trade_log that no longer have a Binance position."""
+    if not trade_log:
+        return
+    for t in trade_log:
+        if t['closed_at'] is None:
+            if symbol is None or t['symbol'] == symbol:
+                t['closed_at'] = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+                t['exit_price'] = t.get('entry_price', 0)
+                t['pnl'] = t.get('pnl', 0) or 0
+                t['pnl_pct'] = 0
+                t['result'] = 'UNKNOWN'
+                print(f"   🧹 Closed stale trade_log entry for {t['symbol']}", flush=True)
 
 
 def cancel_all_open_orders(symbol):
@@ -1964,6 +1996,8 @@ async def main_loop():
                                 last_position_symbol = pos['symbol']
 
                 else:
+                    # Clean up any ghost entries in trade_log
+                    _close_stale_trade_log()
                     print(f"\n[{now}] 🔍 No open position — scanning top 20 coins...", flush=True)
                     opened = await scan_and_trade()
                     if opened:
