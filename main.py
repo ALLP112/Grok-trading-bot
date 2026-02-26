@@ -1314,8 +1314,8 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
     perf_summary = get_recent_performance_summary()
     risk_budget = balance * MAX_RISK_PERCENT / 100
 
-    prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader who thinks from FIRST PRINCIPLES.
-You don't chase pumps. You find asymmetric setups where the market is wrong.
+    prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader.
+You find asymmetric setups with favorable risk/reward. You prefer to be in a trade when there's an edge rather than sitting on the sidelines.
 
 ═══ MACRO CONTEXT ═══
 {market_str if market_str else "Market data unavailable."}
@@ -1334,35 +1334,34 @@ Position sizing is automatic — tighter SL = bigger position, wider SL = smalle
 ═══ FIRST PRINCIPLES ANALYSIS ═══
 Before picking a trade, think through each layer:
 
-**1. MACRO REGIME (most important)**
-- Is BTC in risk-on or risk-off mode? Altcoins get crushed in BTC downtrends regardless of their own setup.
-- If BTC RSI > 70 and bearish divergence, be extremely cautious on longs.
-- If BTC is dumping, only short or hold. Don't fight the tide.
+**1. MACRO REGIME**
+- Check BTC trend. In strong BTC downtrends, prefer shorts or reduce leverage on longs.
+- BTC choppy/mixed = trade individual coin setups on their own merit with moderate leverage.
+- Don't let a neutral BTC prevent you from taking good altcoin setups.
 
 **2. POSITIONING & CROWDING**
-- Long/Short ratio: If >60% are long, the crowd is likely wrong at extremes. Contrarian shorts work.
-- If <40% are long (crowd is short), look for squeeze setups — longs into crowded shorts.
-- L/S trend: If longs are rapidly increasing, retail FOMO is setting in — be cautious on longs.
-- Open Interest: Rising OI + rising price = genuine trend. Rising OI + falling price = shorts building (potential squeeze).
-- Falling OI = positions being closed, trend losing conviction.
+- Long/Short ratio: If >65% are long, contrarian shorts have edge. If <35% are long, look for squeeze longs.
+- L/S trend: Rapidly increasing longs = potential FOMO, adds weight to short thesis but isn't a veto.
+- Open Interest: Rising OI + rising price = genuine trend. Rising OI + falling price = shorts building.
+- Use positioning as an edge multiplier, not a trade filter.
 
 **3. FUNDING RATE AS SENTIMENT**
-- Very positive funding (>0.05%) = longs are paying shorts. Crowded long — favor shorts or wait.
-- Very negative funding (<-0.05%) = shorts paying longs. Crowded short — look for long squeezes.
-- Near zero = neutral, rely on technicals.
-- Extreme funding is a CONTRARIAN signal, not a trend confirmation.
+- Very positive funding (>0.05%) = crowded long, adds edge to shorts but doesn't block longs.
+- Very negative funding (<-0.05%) = crowded short, squeeze longs have extra edge.
+- Near zero = neutral, trade on technicals alone.
+- Funding is a confidence booster, not a gate.
 
 **4. MULTI-TIMEFRAME TREND ALIGNMENT**
 - Best trades: 4h + 1h + 15m ALL agree on direction.
-- Acceptable: 4h + 1h agree, 15m pulling back (entry opportunity).
-- Avoid: 4h says one thing, 1h/15m say another (choppy, no edge).
-- VWAP position matters: trading long below VWAP is fighting institutional flow.
+- Good trades: 2 of 3 timeframes agree — this is enough to enter with moderate leverage.
+- 15m pullback against 1h/4h trend = potential entry opportunity, not a disqualifier.
+- VWAP position is a tiebreaker, not a dealbreaker.
 
 **5. VOLATILITY & MOMENTUM**
-- ATR tells you if there's enough movement. Low ATR (<0.5%) = dead market, skip.
-- Bollinger squeeze (price near mid, bands tight) = explosion coming. Good for breakout trades.
-- Volume ratio >1.5 confirms the move is real. <0.8 means fading interest.
-- Candle streak: +5 or more = exhaustion likely. Don't chase. Wait for pullback.
+- ATR tells you expected movement range. Low ATR = use tighter SL, not a reason to skip.
+- Bollinger squeeze (price near mid, bands tight) = breakout imminent. Good setup.
+- Volume ratio >1.5 adds conviction. <0.8 means lighter position, not no position.
+- Candle streak: +5 or more = consider counter-trend trades or tighter SL, but don't skip entirely.
 
 **6. ORDER FLOW (top 5 coins)**
 - Buy-heavy imbalance + bullish trend = strong confirmation for longs.
@@ -1381,12 +1380,10 @@ Before picking a trade, think through each layer:
 - Near recent high/low as measured by 4h or 1h timeframe.
 - Minimum 2:1 R:R ratio — this is NON-NEGOTIABLE. The system will auto-correct if you violate this.
 
-**9. WHY MOST TRADES SHOULD BE HOLDS**
-- You only need 1-2 great trades per day. Quality > quantity.
-- If the setup isn't screaming at you, it's not a setup.
-- Mixed signals across timeframes = no trade.
-- Just pumped 20%+ = usually too late. The easy money was already made.
-- Holding is a position. It preserves capital for when the edge is clear.
+**9. WHEN TO HOLD**
+- Hold if ALL timeframes conflict with no clear direction.
+- Hold if a coin just pumped 20%+ — usually too late for a clean entry.
+- Otherwise, look for the best available setup. There's usually something tradeable in the top 20.
 
 ═══ RULES ═══
 - CRITICAL: "symbol" must be EXACTLY one of the symbols listed above.
@@ -1394,10 +1391,11 @@ Before picking a trade, think through each layer:
 - For SHORT: stop_loss ABOVE entry, take_profit BELOW entry.
 - SL at a technical invalidation level (0.5-5% from entry).
 - TP at minimum 2:1 R:R (the system enforces this — don't even try 1:1).
-- Leverage 15-20x ONLY when macro + 4h + 1h + 15m all align and funding/positioning confirm.
-- Leverage 5-10x when 2 of 3 timeframes align.
-- DO NOT trade if macro is risk-off and you're picking a long.
-- Confidence ≥ 0.74 to trade. Anything less = hold.
+- Leverage 15-20x when 3/3 timeframes align with confirming positioning/funding.
+- Leverage 7-12x when 2/3 timeframes align — this is your bread and butter.
+- Leverage 3-5x for weaker setups with one strong signal.
+- Confidence ≥ 0.60 to trade. Below 0.60 = hold.
+- You should be trading more often than not. Find the best setup available.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1407,7 +1405,7 @@ Before picking a trade, think through each layer:
   "stop_loss": number (technical invalidation level),
   "take_profit": number (next major level, ≥2x SL distance),
   "confidence": 0.00-1.00,
-  "reason": "2-3 sentences: cite macro regime, positioning, and technical confluence. Explain WHY the market is wrong."
+  "reason": "2-3 sentences: what's the edge? Cite the strongest 2-3 signals that support this trade."
 }}"""
 
     try:
@@ -1477,7 +1475,7 @@ async def execute_trade(decision, balance):
     except (ValueError, TypeError):
         tp = None
 
-    if action == "hold" or confidence < 0.74:
+    if action == "hold" or confidence < 0.60:
         print(f"   💤 HOLD — confidence {confidence:.2f} | {decision.get('reason', 'n/a')}", flush=True)
         return False
 
