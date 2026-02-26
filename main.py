@@ -692,22 +692,46 @@ def place_stop_order(raw_sym, side, order_type, stop_price, close_position=True,
     # For STOP_LOSS: can't use LIMIT (would fill immediately) — caller uses software stop
     is_tp = 'TAKE_PROFIT' in order_type.upper()
     if is_tp and quantity:
-        try:
-            limit_params = {
+        # Try multiple methods to place a LIMIT TP order
+        # Method 1: raw Binance API
+        for method_name, place_func in [
+            ('raw API', lambda: trading_exchange.fapiprivate_post_order({
                 'symbol': raw_sym,
                 'side': side,
                 'type': 'LIMIT',
                 'price': str(stop_price),
                 'quantity': str(quantity),
                 'timeInForce': 'GTC',
-                'reduceOnly': 'true',
-            }
-            result = trading_exchange.fapiprivate_post_order(limit_params)
-            order_id = str(result.get('orderId', 'unknown'))
-            print(f"   📋 TP placed as LIMIT order (sits on book at ${float(stop_price):,.2f})", flush=True)
-            return order_id, 'limit'
-        except Exception as limit_err:
-            raise Exception(f"STOP_MARKET blocked (-4120) and LIMIT fallback failed: {limit_err}")
+            })),
+            ('ccxt', lambda: trading_exchange.create_limit_order(
+                raw_sym.replace('USDT', '/USDT:USDT'),
+                side.lower(),
+                float(quantity),
+                float(stop_price),
+            )),
+        ]:
+            try:
+                result = place_func()
+                order_id = str(result.get('orderId', result.get('id', 'unknown')))
+
+                # Verify it actually persists
+                time.sleep(2)
+                try:
+                    check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': order_id})
+                    status = check.get('status', '?')
+                    if status not in ('NEW', 'PARTIALLY_FILLED'):
+                        print(f"   ⚠️ LIMIT order via {method_name} auto-cancelled (status={status})", flush=True)
+                        continue  # Try next method
+                except Exception:
+                    pass  # Can't verify — proceed optimistically
+
+                print(f"   📋 TP placed as LIMIT order via {method_name} at ${float(stop_price):,.2f}", flush=True)
+                return order_id, 'limit'
+            except Exception as e:
+                print(f"   ⚠️ LIMIT via {method_name} failed: {e}", flush=True)
+                continue
+
+        raise Exception(f"STOP_MARKET blocked (-4120) and all LIMIT methods failed")
 
     # SL can't use LIMIT — raise so caller activates software stop
     raise Exception(f"STOP_MARKET blocked (-4120) — no LIMIT fallback for SL")
