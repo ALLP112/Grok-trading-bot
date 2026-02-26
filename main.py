@@ -28,7 +28,7 @@ load_dotenv()
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 
@@ -554,42 +554,8 @@ def get_open_position():
         return None
 
 
-def has_sl_tp_orders(symbol):
-    """Check if position is protected. SL = software monitor, TP = LIMIT on exchange."""
-    has_sl = False
-    has_tp = False
-    all_orders = []
 
-    # SL is always software-monitored on Binance demo
-    if _active_sl_tp.get('symbol') == symbol and _active_sl_tp.get('sl_price'):
-        has_sl = True
-
-    # TP: check if LIMIT order is still on exchange
-    if _active_sl_tp.get('symbol') == symbol and _active_sl_tp.get('tp_id'):
-        try:
-            orders = trading_exchange.fetch_open_orders(symbol)
-            all_orders = orders
-            for o in orders:
-                if str(o.get('id', '')) == _active_sl_tp['tp_id']:
-                    has_tp = True
-                    break
-        except Exception as e:
-            print(f"   🔍 fetch_open_orders failed: {e}", flush=True)
-
-        # Fallback: check by order ID directly
-        if not has_tp:
-            try:
-                raw_sym = symbol_to_binance_raw(symbol)
-                check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']})
-                if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
-                    has_tp = True
-            except Exception:
-                pass
-
-    return has_sl, has_tp, all_orders
-
-
-# Track placed order IDs
+# Track placed order IDs (kept for handle_position_close cleanup)
 _active_sl_tp = {
     'symbol': None,
     'sl_id': None,
@@ -612,124 +578,6 @@ def reset_sl_tp_tracking():
     _active_sl_tp['position_side'] = None
 
 
-def place_sl_tp_orders(symbol, side, sl_price, tp_price, quantity):
-    """Place TP as LIMIT order + track SL for software monitoring.
-    Binance demo blocks all conditional orders (STOP, STOP_MARKET, TAKE_PROFIT, etc).
-    Only LIMIT and MARKET work. LIMIT TP sits on book; SL must be software-monitored.
-    Returns (sl_id, tp_id)."""
-    raw_sym = symbol_to_binance_raw(symbol)
-    order_side = 'SELL' if side == 'long' else 'BUY'
-    tp_id = None
-
-    # === TP: LIMIT order (sits on book, fills when price arrives) ===
-    try:
-        result = trading_exchange.fapiprivate_post_order({
-            'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
-            'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
-        })
-        tp_id = str(result.get('orderId', ''))
-        # Verify it wasn't auto-cancelled by Binance demo
-        time.sleep(2)
-        try:
-            check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': tp_id})
-            status = check.get('status', '?')
-            if status in ('NEW', 'PARTIALLY_FILLED'):
-                print(f"   ✅ TP placed and verified (LIMIT @ ${tp_price:,.2f}) [id={tp_id}]", flush=True)
-            else:
-                print(f"   ⚠️ TP was auto-cancelled by Binance (status={status})", flush=True)
-                tp_id = None
-        except Exception:
-            print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f}) [unverified]", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ TP LIMIT failed: {e}", flush=True)
-
-    # === SL: software-monitored (no exchange order type works on demo) ===
-    print(f"   🛡️ SL tracked via software monitor @ ${sl_price:,.2f} (checked every 60s)", flush=True)
-
-    # Track
-    _active_sl_tp['symbol'] = symbol
-    _active_sl_tp['sl_id'] = None  # No exchange order for SL
-    _active_sl_tp['tp_id'] = tp_id
-    _active_sl_tp['placed_at'] = time.time()
-    _active_sl_tp['sl_price'] = sl_price
-    _active_sl_tp['tp_price'] = tp_price
-    _active_sl_tp['position_side'] = side
-
-    return None, tp_id
-
-
-
-
-def check_software_sl(position):
-    """Check if software SL should trigger. Returns True if position was closed."""
-    if _active_sl_tp.get('symbol') != position['symbol']:
-        return False
-    sl = _active_sl_tp.get('sl_price')
-    side = _active_sl_tp.get('position_side')
-    if not sl or not side:
-        return False
-
-    try:
-        ticker = public_exchange.fetch_ticker(position['symbol'])
-        current = ticker['last']
-    except Exception:
-        return False  # Skip this check on error
-
-    triggered = False
-    if side == 'long' and current <= sl:
-        triggered = True
-    elif side == 'short' and current >= sl:
-        triggered = True
-
-    if triggered:
-        print(f"   🛡️ SOFTWARE SL TRIGGERED: price ${current:,.2f} hit SL ${sl:,.2f}", flush=True)
-        force_close_position(position['symbol'], f"Software SL at ${current:,.2f}")
-        return True
-
-    # Status log
-    if side == 'long':
-        sl_dist = (current - sl) / current * 100
-    else:
-        sl_dist = (sl - current) / current * 100
-    tp_str = " | TP on exchange" if _active_sl_tp.get('tp_id') else ""
-    print(f"   🛡️ SL monitor: ${current:,.2f} | SL {sl_dist:.1f}% away{tp_str}", flush=True)
-    return False
-
-
-def place_emergency_sl_tp(position):
-    """Place emergency SL/TP as two LIMIT orders."""
-    symbol = position['symbol']
-    side = position['side']
-    entry = position['entry_price']
-    if entry <= 0:
-        print(f"   ⚠️ Cannot place emergency SL/TP — entry price unknown", flush=True)
-        return False
-
-    # Wait for Binance to fully register the position
-    time.sleep(3)
-
-    # Re-verify position still exists
-    current_pos = get_open_position()
-    if not current_pos or current_pos['symbol'] != symbol:
-        print(f"   ⚠️ Position no longer exists — skipping emergency SL/TP", flush=True)
-        return True
-
-    contracts = current_pos['contracts']
-    side = current_pos['side']
-    entry = current_pos['entry_price'] if current_pos['entry_price'] > 0 else entry
-
-    if side == 'long':
-        sl = round_price(entry * 0.97, symbol)
-        tp = round_price(entry * 1.045, symbol)
-    else:
-        sl = round_price(entry * 1.03, symbol)
-        tp = round_price(entry * 0.955, symbol)
-
-    qty = float(round_amount(contracts, symbol))
-    print(f"   📋 Emergency SL/TP: {side.upper()} {contracts} @ ${entry:,.2f} → SL ${sl:,.2f} / TP ${tp:,.2f}", flush=True)
-
-    place_sl_tp_orders(symbol, side, sl, tp, qty)
-    return True
 
 
 def force_close_position(symbol, reason=""):
@@ -1356,6 +1204,132 @@ Before picking a trade, think through each layer:
         return {"action": "hold", "confidence": 0}
 
 
+
+# ============================================================
+#  GROK POSITION MANAGEMENT
+# ============================================================
+
+async def grok_evaluate_position(position, candidates, balance):
+    """Ask Grok whether to keep or close an existing position.
+    Returns {'action': 'keep'|'close', 'reason': '...'}"""
+    symbol = position['symbol']
+    side = position['side']
+    entry = position['entry_price']
+    pnl = position['unrealized_pnl']
+    pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
+    leverage = position['leverage']
+
+    # Find this coin's enriched data
+    coin_data = None
+    for c in candidates:
+        if c['symbol'] == symbol:
+            coin_data = c
+            break
+
+    # Build market data string for the position's coin
+    coin_str = ""
+    if coin_data:
+        ta15 = coin_data.get('ta_15m')
+        ta1h = coin_data.get('ta_1h')
+        ta4h = coin_data.get('ta_4h')
+        ob = coin_data.get('order_book')
+        coin_str = f"Price: ${coin_data['price']:,.2f} | 24h: {coin_data['change24h']:+.2f}% | Funding: {coin_data.get('funding', 0) * 100:.4f}%\n"
+        coin_str += f"OI: ${coin_data.get('oi_notional', 0) / 1e6:.1f}M | L/S: {coin_data.get('long_short_ratio', 1.0):.2f}\n"
+        if ta15:
+            coin_str += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | Mom: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d}\n"
+        if ta1h:
+            coin_str += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | Mom: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
+        if ta4h:
+            coin_str += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | Mom: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
+        if ob:
+            coin_str += f"Book: {ob['imbalance_label']} (imb {ob['imbalance']:+.2f}) | Spread {ob['spread_pct']:.4f}%\n"
+
+    # Market context
+    mc = candidates[0].get('market_context', {}) if candidates else {}
+    market_str = ""
+    if mc:
+        market_str = f"BTC: ${mc.get('btc_price', 0):,.0f} | 4h: {mc.get('btc_4h_pct', 0):+.2f}% | 24h: {mc.get('btc_24h_pct', 0):+.2f}% | RSI: {mc.get('btc_rsi', 50):.0f} | Trend: {mc.get('btc_ema_trend', 'mixed')}"
+
+    prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader managing an open position.
+
+═══ MACRO ═══
+{market_str if market_str else "Unavailable"}
+
+═══ OPEN POSITION ═══
+{side.upper()} {symbol} | Entry: ${entry:,.2f} | {leverage}x Cross
+Unrealized PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)
+Notional: ${position['notional']:,.0f} | Contracts: {position['contracts']}
+
+═══ CURRENT MARKET DATA FOR {symbol} ═══
+{coin_str if coin_str else "Data unavailable — close if uncertain."}
+
+═══ FIRST PRINCIPLES POSITION MANAGEMENT ═══
+Think through each layer before deciding:
+
+**1. IS THE MACRO STILL SUPPORTIVE?**
+- If you're long and BTC is now in a clear downtrend (not just a dip), that weakens your thesis.
+- BTC choppy/sideways is fine for altcoin positions — don't close just because BTC isn't pumping.
+- A macro shift against your direction is a strong close signal, but a neutral macro is not.
+
+**2. HAS THE POSITIONING/CROWDING STORY CHANGED?**
+- If you entered a squeeze play (e.g. short squeeze on negative funding), is the funding still negative? Has it normalized?
+- If L/S ratio has flipped against your thesis, that's worth noting but not an automatic close.
+- Positioning that was your edge disappearing = weaker conviction to hold.
+
+**3. ARE THE TRENDS STILL ALIGNED?**
+- Check if the multi-timeframe alignment that got you into this trade still holds.
+- One timeframe flipping is normal noise. Two or more flipping = thesis weakening.
+- 15m noise against your position is fine if 1h and 4h still support you.
+
+**4. MOMENTUM & PRICE ACTION**
+- Is momentum still in your favor or has it clearly shifted?
+- Candle streaks extending in your direction = let it run.
+- Momentum flipping on 1h+ timeframes = consider closing.
+- Price breaking below key EMAs (for longs) or above (for shorts) is meaningful.
+
+**5. PROFIT & LOSS REALITY**
+- Nice profit (>3-5% leveraged)? Consider taking it — don't be greedy, but don't panic-close small gains either.
+- Moderate loss (-3% to -8% leveraged)? Only close if the thesis is also broken. Losses alone aren't a reason to close if the setup is still valid.
+- Large loss (>-10% leveraged)? Close unless you have very strong conviction the thesis is intact.
+- Small loss or small gain? Focus on whether the thesis holds, not the P&L.
+
+**6. OVERALL JUDGMENT**
+- The default should be to KEEP if nothing has fundamentally changed.
+- Don't close on minor pullbacks or noise — these are leveraged positions, some volatility is expected.
+- CLOSE when your original reason for entering is no longer valid, or when a clear better opportunity exists.
+- You're re-evaluated every {INTERVAL_MINUTES} minutes, so there's no urgency to close on weak signals.
+
+═══ RESPOND WITH ONLY VALID JSON ═══
+{{
+  "action": "keep" | "close",
+  "reason": "1-2 sentences: what changed or didn't change since entry?"
+}}"""
+
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="grok-4-1-fast-reasoning",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=300
+            ),
+            timeout=60
+        )
+        text = response.choices[0].message.content.strip()
+        result = parse_grok_json(text)
+        if result and result.get('action') in ('keep', 'close'):
+            return result
+        print(f"   ⚠️ Grok position eval parse failed — defaulting to keep", flush=True)
+        print(f"   [RAW]: {text[:200]}", flush=True)
+        return {"action": "keep", "reason": "Parse failure — holding"}
+    except asyncio.TimeoutError:
+        print("   ⏰ Grok position eval timed out — keeping position", flush=True)
+        return {"action": "keep", "reason": "API timeout"}
+    except Exception as e:
+        print(f"   ⚠️ Grok position eval error: {e} — keeping position", flush=True)
+        return {"action": "keep", "reason": f"API error: {e}"}
+
+
 # ============================================================
 #  TRADE EXECUTION
 # ============================================================
@@ -1533,14 +1507,12 @@ async def execute_trade(decision, balance):
                 else:
                     raise
 
-        # Log the trade immediately (position IS open now regardless of SL/TP success)
+        # Log the trade immediately
         log_trade_open(symbol, action, actual_notional, leverage, current_price, sl, tp,
                        confidence, decision.get('reason', ''), actual_margin, actual_risk)
 
-        # Place SL/TP as two LIMIT orders
-        sl_id, tp_id = place_sl_tp_orders(symbol, action, sl, tp, amount)
-
-        # R:R ratio
+        # No SL/TP orders — Grok manages position each cycle
+        # R:R ratio (for logging only)
         if action == "long":
             risk = abs(current_price - sl)
             reward = abs(tp - current_price)
@@ -1551,7 +1523,8 @@ async def execute_trade(decision, balance):
 
         print(f"   🔥 OPENED {action.upper()} {symbol} @ ${current_price:,.2f} | {leverage}x Cross", flush=True)
         print(f"   📐 Notional: ${actual_notional:,.0f} | Margin: ${actual_margin:,.0f} | Risk: ${actual_risk:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
-        print(f"   🛑 SL: ${sl:,.2f} (-{sl_dist_pct:.1f}%) | 🎯 TP: ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
+        print(f"   📊 Grok targets: SL ${sl:,.2f} (-{sl_dist_pct:.1f}%) | TP ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
+        print(f"   🤖 Grok will re-evaluate every {INTERVAL_MINUTES} min — no exchange SL/TP orders", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
         return True
@@ -1564,17 +1537,77 @@ async def execute_trade(decision, balance):
             print(f"   ⚠️ Binance transient error on {symbol} — will retry next cycle", flush=True)
         else:
             print(f"   ❌ Execution error on {symbol}: {e}", flush=True)
-        # For any error, check if we have a naked position and protect it
-        if '-4411' not in err_str:
-            pos = get_open_position()
-            if pos and pos['symbol'] == symbol:
-                place_emergency_sl_tp(pos)
         return False
 
 
 # ============================================================
 #  SCAN + TRADE
 # ============================================================
+#  SCAN + TRADE / MANAGE POSITION
+# ============================================================
+
+async def manage_position(position):
+    """Ask Grok whether to keep or close the current position. Returns True if closed."""
+    try:
+        candidates = await get_top_candidates(20)
+        if not candidates:
+            print(f"   ⚠️ No market data — keeping position", flush=True)
+            return False
+
+        # Ensure the position's coin is in candidates
+        pos_in_candidates = any(c['symbol'] == position['symbol'] for c in candidates)
+        if not pos_in_candidates:
+            # Fetch just this coin's data
+            try:
+                ticker = public_exchange.fetch_ticker(position['symbol'])
+                candidates.insert(0, {
+                    'symbol': position['symbol'],
+                    'price': ticker['last'],
+                    'change24h': ticker.get('percentage', 0) or 0,
+                    'volume': ticker.get('quoteVolume', 0) or 0,
+                })
+            except Exception:
+                pass
+
+        # Enrich (position coin + top others for context)
+        print(f"   🔬 Enriching market data for position evaluation...", flush=True)
+        enriched = await deep_enrich(candidates, 10)
+
+        balance = None
+        for bal_attempt in range(3):
+            try:
+                balance_data = trading_exchange.fetch_balance()
+                balance = float(balance_data['total'].get('USDT', 0))
+                break
+            except Exception:
+                if bal_attempt < 2:
+                    await asyncio.sleep(5)
+        if balance:
+            print(f"   💰 Balance: ${balance:,.2f} USDT", flush=True)
+            if session_start_balance and session_start_balance > 0:
+                session_pnl = balance - session_start_balance
+                print(f"   📊 Session PnL: ${session_pnl:+,.2f} ({session_pnl / session_start_balance * 100:+.2f}%)", flush=True)
+
+        # Ask Grok
+        eval_result = await grok_evaluate_position(position, enriched, balance or 0)
+        action = eval_result.get('action', 'keep')
+        reason = eval_result.get('reason', 'n/a')
+
+        if action == 'close':
+            print(f"   🤖 Grok says CLOSE: {reason}", flush=True)
+            force_close_position(position['symbol'], f"Grok: {reason}")
+            return True
+        else:
+            print(f"   🤖 Grok says KEEP: {reason}", flush=True)
+            return False
+
+    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+        print(f"   🚫 Rate limited during position eval — keeping: {str(e)[:80]}", flush=True)
+        return False
+    except Exception as e:
+        print(f"   ❌ Position eval error — keeping: {e}", flush=True)
+        return False
+
 
 async def scan_and_trade():
     try:
@@ -1721,29 +1754,20 @@ async def main_loop():
             print(f"   ⚠️ Cleanup error: {e}", flush=True)
             break
 
-    # Check for orphaned position on startup
+    # Check for existing position on startup
     position = get_open_position()
     if position:
-        # On restart, we have no tracking state. Nuclear cancel EVERYTHING first to prevent duplicate orders.
         print(f"   📍 Found existing position: {position['side'].upper()} {position['symbol']}", flush=True)
+        print(f"   🤖 Grok will evaluate this position on first cycle", flush=True)
+        # Cancel any stale orders from previous runs
         try:
             raw_sym = symbol_to_binance_raw(position['symbol'])
             trading_exchange.fapiprivate_delete_allopenorders({'symbol': raw_sym})
-            print(f"   🧹 Nuclear cancelled all orders on {position['symbol']}", flush=True)
-        except Exception as e:
-            print(f"   ⚠️ Nuclear cancel failed: {e} — trying regular cancel", flush=True)
-            cancel_all_open_orders(position['symbol'])
-        await asyncio.sleep(2)
-
-        # Place fresh SL/TP (we just nuked everything, so definitely need new ones)
-        print(f"   🚨 Placing fresh emergency SL/TP after restart", flush=True)
-        success = place_emergency_sl_tp(position)
-        if not success:
-            force_close_position(position['symbol'], "Can't place SL/TP on restart")
-            position = None  # Reset so we scan fresh
-        else:
-            last_position_symbol = position['symbol']
-            had_position_last_cycle = True
+            print(f"   🧹 Cancelled stale orders on {position['symbol']}", flush=True)
+        except Exception:
+            pass
+        last_position_symbol = position['symbol']
+        had_position_last_cycle = True
 
     try:
         print_income_summary()
@@ -1772,54 +1796,38 @@ async def main_loop():
                       f"Contracts: {position['contracts']} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
 
-                # === Software SL check ===
-                if check_software_sl(position):
+                # Ask Grok: keep or close?
+                closed = await manage_position(position)
+                if closed:
                     had_position_last_cycle = False
                     last_position_symbol = None
-                    continue
+                    try:
+                        handle_position_close(position['symbol'])
+                    except Exception as hpc_err:
+                        print(f"   ⚠️ Error in close handler: {hpc_err}", flush=True)
+                    print_pnl_dashboard()
 
-                # === Ensure TP LIMIT is on exchange ===
-                # If _active_sl_tp doesn't match this position, set it up fresh
-                if _active_sl_tp.get('symbol') != position['symbol']:
-                    print(f"   🚨 No SL/TP tracking for {position['symbol']} — placing fresh...", flush=True)
-                    cancel_all_open_orders(position['symbol'])
-                    place_emergency_sl_tp(position)
-                else:
-                    # Verify TP order still exists on exchange
-                    tp_alive = False
-                    if _active_sl_tp.get('tp_id'):
-                        try:
-                            raw_sym = symbol_to_binance_raw(position['symbol'])
-                            check = trading_exchange.fapiprivate_get_order({
-                                'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']
-                            })
-                            if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
-                                tp_alive = True
-                        except Exception:
-                            pass
-                    if not tp_alive:
-                        print(f"   🚨 TP order missing or cancelled — re-placing...", flush=True)
-                        cancel_all_open_orders(position['symbol'])
-                        place_emergency_sl_tp(position)
-                    else:
-                        print(f"   ⏳ TP on exchange ✅ | SL software monitor ✅", flush=True)
+                    # Immediate rescan after closing
+                    print(f"\n[{now}] 🔍 Immediate rescan after Grok-close...", flush=True)
+                    opened = await scan_and_trade()
+                    if opened:
+                        had_position_last_cycle = True
+                        pos = get_open_position()
+                        if pos:
+                            last_position_symbol = pos['symbol']
 
             else:
                 if had_position_last_cycle and last_position_symbol:
-                    # CRITICAL: Double-check before assuming position is closed
-                    # A transient API error could make get_open_position return None
+                    # Position was closed externally (liquidation, manual, TP hit)
                     await asyncio.sleep(2)
                     recheck = get_open_position()
                     if recheck:
-                        # False alarm — position is still open
                         print(f"\n[{now}] ⚠️ Position re-detected after transient glitch — {recheck['side'].upper()} {recheck['symbol']}", flush=True)
                         last_position_symbol = recheck['symbol']
                         had_position_last_cycle = True
                     else:
-                        # Confirmed closed
                         print(f"\n[{now}] 🔔 Position CLOSED on {last_position_symbol}!", flush=True)
                         closed_sym = last_position_symbol
-                        # Reset state FIRST to prevent re-detection loop
                         last_position_symbol = None
                         had_position_last_cycle = False
                         try:
@@ -1838,7 +1846,6 @@ async def main_loop():
                                 last_position_symbol = pos['symbol']
 
                 else:
-                    # Clean up any ghost entries in trade_log
                     _close_stale_trade_log()
                     print(f"\n[{now}] 🔍 No open position — scanning top 20 coins...", flush=True)
                     opened = await scan_and_trade()
@@ -1854,8 +1861,7 @@ async def main_loop():
 
         except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
             ban_msg = str(e)
-            wait = 120  # Default 2 min
-
+            wait = 120
             if 'banned until' in ban_msg:
                 try:
                     ban_ts = int(''.join(c for c in ban_msg.split('banned until')[1].split('.')[0].strip() if c.isdigit()))
@@ -1864,80 +1870,17 @@ async def main_loop():
                         wait = min(ban_remaining + 30, 600)
                 except Exception:
                     pass
-
-            print(f"   🚫 Binance rate limit/ban in main loop: {ban_msg[:100]}", flush=True)
-            print(f"   ⏳ Sleeping {wait:.0f}s before resuming...", flush=True)
-            # Still monitor SL during rate limit wait
-            if had_position_last_cycle and _active_sl_tp.get('sl_price') and _active_sl_tp.get('symbol'):
-                ban_elapsed = 0
-                while ban_elapsed < wait:
-                    await asyncio.sleep(min(60, wait - ban_elapsed))
-                    ban_elapsed += 60
-                    sl = _active_sl_tp.get('sl_price')
-                    side = _active_sl_tp.get('position_side')
-                    sym = _active_sl_tp.get('symbol')
-                    if sl and side and sym:
-                        try:
-                            ticker = public_exchange.fetch_ticker(sym)
-                            current = ticker['last']
-                            hit = (side == 'long' and current <= sl) or (side == 'short' and current >= sl)
-                            if hit:
-                                print(f"   🛡️ SOFTWARE SL TRIGGERED during ban wait: ${current:,.2f}", flush=True)
-                                pos = get_open_position()
-                                if pos:
-                                    force_close_position(pos['symbol'], f"Software SL at ${current:,.2f}")
-                                had_position_last_cycle = False
-                                last_position_symbol = None
-                                break
-                        except Exception:
-                            pass
-            else:
-                await asyncio.sleep(wait)
+            print(f"   🚫 Binance rate limit/ban: {ban_msg[:100]}", flush=True)
+            print(f"   ⏳ Sleeping {wait:.0f}s...", flush=True)
+            await asyncio.sleep(wait)
             continue
 
         except Exception as e:
             print(f"   ❌ Loop error: {e}", flush=True)
             traceback.print_exc()
 
-        # Sleep: poll every 60s for software SL if position open, otherwise full interval
-        if had_position_last_cycle and _active_sl_tp.get('sl_price') and _active_sl_tp.get('symbol'):
-            total_wait = INTERVAL_MINUTES * 60
-            elapsed = 0
-            print(f"   ⏰ SL monitor active — checking every 60s for {total_wait // 60} min", flush=True)
-            while elapsed < total_wait:
-                await asyncio.sleep(60)
-                elapsed += 60
-                sl = _active_sl_tp.get('sl_price')
-                side = _active_sl_tp.get('position_side')
-                sym = _active_sl_tp.get('symbol')
-                if not sl or not side or not sym:
-                    break
-                try:
-                    ticker = public_exchange.fetch_ticker(sym)
-                    current = ticker['last']
-                    triggered = False
-                    if side == 'long' and current <= sl:
-                        triggered = True
-                    elif side == 'short' and current >= sl:
-                        triggered = True
-                    if triggered:
-                        print(f"   🛡️ SOFTWARE SL TRIGGERED: ${current:,.2f} hit SL ${sl:,.2f}", flush=True)
-                        pos = get_open_position()
-                        if pos:
-                            force_close_position(pos['symbol'], f"Software SL at ${current:,.2f}")
-                        had_position_last_cycle = False
-                        last_position_symbol = None
-                        break
-                    else:
-                        if side == 'long':
-                            sl_dist = (current - sl) / current * 100
-                        else:
-                            sl_dist = (sl - current) / current * 100
-                        print(f"   🛡️ SL check: ${current:,.2f} | SL {sl_dist:.1f}% away | {elapsed}s/{total_wait}s", flush=True)
-                except Exception as e:
-                    print(f"   ⚠️ SL check error (will retry): {str(e)[:80]}", flush=True)
-        else:
-            await asyncio.sleep(INTERVAL_MINUTES * 60)
+        # Simple sleep — Grok re-evaluates next cycle
+        await asyncio.sleep(INTERVAL_MINUTES * 60)
 
 
 # Crash-proof wrapper — restart on unexpected death
