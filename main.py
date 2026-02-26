@@ -628,7 +628,18 @@ def place_sl_tp_orders(symbol, side, sl_price, tp_price, quantity):
             'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
         })
         tp_id = str(result.get('orderId', ''))
-        print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f})", flush=True)
+        # Verify it wasn't auto-cancelled by Binance demo
+        time.sleep(2)
+        try:
+            check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': tp_id})
+            status = check.get('status', '?')
+            if status in ('NEW', 'PARTIALLY_FILLED'):
+                print(f"   ✅ TP placed and verified (LIMIT @ ${tp_price:,.2f}) [id={tp_id}]", flush=True)
+            else:
+                print(f"   ⚠️ TP was auto-cancelled by Binance (status={status})", flush=True)
+                tp_id = None
+        except Exception:
+            print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f}) [unverified]", flush=True)
     except Exception as e:
         print(f"   ⚠️ TP LIMIT failed: {e}", flush=True)
 
@@ -762,12 +773,19 @@ def force_close_position(symbol, reason=""):
 
 
 def _close_stale_trade_log(symbol=None):
-    """Close any open entries in trade_log that no longer have a Binance position."""
+    """Close any open entries in trade_log that no longer have a Binance position.
+    If symbol is given, only close that symbol. Otherwise close all stale entries
+    EXCEPT the currently open position."""
     if not trade_log:
         return
+    # Find the actual open position on Binance
+    current_pos = get_open_position()
+    current_symbol = current_pos['symbol'] if current_pos else None
+
     for t in trade_log:
         if t['closed_at'] is None:
-            if symbol is None or t['symbol'] == symbol:
+            target = symbol or t['symbol']
+            if t['symbol'] == target and t['symbol'] != current_symbol:
                 t['closed_at'] = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
                 t['exit_price'] = t.get('entry_price', 0)
                 t['pnl'] = t.get('pnl', 0) or 0
@@ -1732,6 +1750,9 @@ async def main_loop():
     except Exception:
         pass
 
+    # Clean up any ghost trade_log entries from previous runs
+    _close_stale_trade_log()
+
     cycle_count = 0
 
     while True:
@@ -1757,14 +1778,31 @@ async def main_loop():
                     last_position_symbol = None
                     continue
 
-                # === Verify TP LIMIT still on exchange ===
-                has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
-                if not has_tp:
-                    print(f"   🚨 TP order missing — re-placing...", flush=True)
+                # === Ensure TP LIMIT is on exchange ===
+                # If _active_sl_tp doesn't match this position, set it up fresh
+                if _active_sl_tp.get('symbol') != position['symbol']:
+                    print(f"   🚨 No SL/TP tracking for {position['symbol']} — placing fresh...", flush=True)
                     cancel_all_open_orders(position['symbol'])
                     place_emergency_sl_tp(position)
                 else:
-                    print(f"   ⏳ TP on exchange ✅ | SL software monitor ✅", flush=True)
+                    # Verify TP order still exists on exchange
+                    tp_alive = False
+                    if _active_sl_tp.get('tp_id'):
+                        try:
+                            raw_sym = symbol_to_binance_raw(position['symbol'])
+                            check = trading_exchange.fapiprivate_get_order({
+                                'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']
+                            })
+                            if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
+                                tp_alive = True
+                        except Exception:
+                            pass
+                    if not tp_alive:
+                        print(f"   🚨 TP order missing or cancelled — re-placing...", flush=True)
+                        cancel_all_open_orders(position['symbol'])
+                        place_emergency_sl_tp(position)
+                    else:
+                        print(f"   ⏳ TP on exchange ✅ | SL software monitor ✅", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
@@ -1837,20 +1875,35 @@ async def main_loop():
             traceback.print_exc()
 
         # Sleep: poll every 60s for software SL if position open, otherwise full interval
-        if had_position_last_cycle and _active_sl_tp.get('sl_price'):
+        if had_position_last_cycle and _active_sl_tp.get('sl_price') and _active_sl_tp.get('symbol'):
             total_wait = INTERVAL_MINUTES * 60
             elapsed = 0
             while elapsed < total_wait:
                 await asyncio.sleep(60)
                 elapsed += 60
-                pos = get_open_position()
-                if pos and _active_sl_tp.get('sl_price'):
-                    if check_software_sl(pos):
+                sl = _active_sl_tp.get('sl_price')
+                side = _active_sl_tp.get('position_side')
+                sym = _active_sl_tp.get('symbol')
+                if not sl or not side or not sym:
+                    break
+                try:
+                    ticker = public_exchange.fetch_ticker(sym)
+                    current = ticker['last']
+                    triggered = False
+                    if side == 'long' and current <= sl:
+                        triggered = True
+                    elif side == 'short' and current >= sl:
+                        triggered = True
+                    if triggered:
+                        print(f"   🛡️ SOFTWARE SL TRIGGERED: ${current:,.2f} hit SL ${sl:,.2f}", flush=True)
+                        pos = get_open_position()
+                        if pos:
+                            force_close_position(pos['symbol'], f"Software SL at ${current:,.2f}")
                         had_position_last_cycle = False
                         last_position_symbol = None
                         break
-                elif not pos and had_position_last_cycle:
-                    break  # Position closed by TP
+                except Exception:
+                    pass  # Rate limit or error — try again next cycle
         else:
             await asyncio.sleep(INTERVAL_MINUTES * 60)
 
