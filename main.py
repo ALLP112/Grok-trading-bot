@@ -555,52 +555,36 @@ def get_open_position():
 
 
 def has_sl_tp_orders(symbol):
-    """Check if a position has SL and TP orders."""
+    """Check if position is protected. SL = software monitor, TP = LIMIT on exchange."""
     has_sl = False
     has_tp = False
     all_orders = []
 
-    # Method 1: ccxt fetch_open_orders
-    try:
-        orders = trading_exchange.fetch_open_orders(symbol)
-        all_orders = orders
-        for o in orders:
-            otype = (o.get('type') or '').upper()
-            oraw = (o.get('info', {}).get('type') or '').upper()
-            oid = str(o.get('id', ''))
-            # Match by tracked order ID first
-            if oid and oid == _active_sl_tp.get('sl_id'):
-                has_sl = True
-            elif oid and oid == _active_sl_tp.get('tp_id'):
-                has_tp = True
-            # Then by order type
-            elif otype in ('STOP_MARKET', 'STOP') or oraw in ('STOP_MARKET', 'STOP'):
-                has_sl = True
-            elif otype in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT') or oraw in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
-                has_tp = True
-    except Exception as e:
-        print(f"   🔍 fetch_open_orders failed: {e}", flush=True)
+    # SL is always software-monitored on Binance demo
+    if _active_sl_tp.get('symbol') == symbol and _active_sl_tp.get('sl_price'):
+        has_sl = True
 
-    # Method 2: check by tracked order IDs if not found above
-    if (not has_sl or not has_tp) and _active_sl_tp.get('symbol') == symbol:
-        placed_at = _active_sl_tp.get('placed_at', 0)
-        age = time.time() - placed_at
-        if age < 1200:  # Within 20 minutes
-            raw_sym = symbol_to_binance_raw(symbol)
-            if not has_sl and _active_sl_tp.get('sl_id'):
-                try:
-                    check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': _active_sl_tp['sl_id']})
-                    if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
-                        has_sl = True
-                except Exception:
-                    pass
-            if not has_tp and _active_sl_tp.get('tp_id'):
-                try:
-                    check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']})
-                    if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
-                        has_tp = True
-                except Exception:
-                    pass
+    # TP: check if LIMIT order is still on exchange
+    if _active_sl_tp.get('symbol') == symbol and _active_sl_tp.get('tp_id'):
+        try:
+            orders = trading_exchange.fetch_open_orders(symbol)
+            all_orders = orders
+            for o in orders:
+                if str(o.get('id', '')) == _active_sl_tp['tp_id']:
+                    has_tp = True
+                    break
+        except Exception as e:
+            print(f"   🔍 fetch_open_orders failed: {e}", flush=True)
+
+        # Fallback: check by order ID directly
+        if not has_tp:
+            try:
+                raw_sym = symbol_to_binance_raw(symbol)
+                check = trading_exchange.fapiprivate_get_order({'symbol': raw_sym, 'orderId': _active_sl_tp['tp_id']})
+                if check.get('status') in ('NEW', 'PARTIALLY_FILLED'):
+                    has_tp = True
+            except Exception:
+                pass
 
     return has_sl, has_tp, all_orders
 
@@ -629,70 +613,76 @@ def reset_sl_tp_tracking():
 
 
 def place_sl_tp_orders(symbol, side, sl_price, tp_price, quantity):
-    """Place SL and TP orders. Uses STOP (stop-limit) for SL and TAKE_PROFIT (stop-limit) for TP.
-    Falls back to LIMIT if stop types are blocked (-4120).
+    """Place TP as LIMIT order + track SL for software monitoring.
+    Binance demo blocks all conditional orders (STOP, STOP_MARKET, TAKE_PROFIT, etc).
+    Only LIMIT and MARKET work. LIMIT TP sits on book; SL must be software-monitored.
     Returns (sl_id, tp_id)."""
     raw_sym = symbol_to_binance_raw(symbol)
     order_side = 'SELL' if side == 'long' else 'BUY'
-    sl_id = None
     tp_id = None
 
-    # SL price buffer: slightly worse than trigger to ensure fill
-    if side == 'long':
-        sl_limit_price = round_price(sl_price * 0.998, symbol)  # Slightly below trigger
-        tp_limit_price = round_price(tp_price * 0.998, symbol)  # Slightly below trigger (selling)
-    else:
-        sl_limit_price = round_price(sl_price * 1.002, symbol)  # Slightly above trigger
-        tp_limit_price = round_price(tp_price * 1.002, symbol)  # Slightly above trigger (buying)
-
-    # === SL: STOP order (stop-limit) ===
+    # === TP: LIMIT order (sits on book, fills when price arrives) ===
     try:
         result = trading_exchange.fapiprivate_post_order({
-            'symbol': raw_sym, 'side': order_side, 'type': 'STOP',
-            'stopPrice': str(sl_price), 'price': str(sl_limit_price),
-            'quantity': str(quantity), 'timeInForce': 'GTC',
-            'workingType': 'CONTRACT_PRICE',
-        })
-        sl_id = str(result.get('orderId', ''))
-        print(f"   ✅ SL placed (STOP-LIMIT trigger=${sl_price:,.2f} limit=${sl_limit_price:,.2f})", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ SL STOP failed: {e}", flush=True)
-
-    # === TP: TAKE_PROFIT order (stop-limit) ===
-    try:
-        result = trading_exchange.fapiprivate_post_order({
-            'symbol': raw_sym, 'side': order_side, 'type': 'TAKE_PROFIT',
-            'stopPrice': str(tp_price), 'price': str(tp_limit_price),
-            'quantity': str(quantity), 'timeInForce': 'GTC',
-            'workingType': 'CONTRACT_PRICE',
+            'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
+            'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
         })
         tp_id = str(result.get('orderId', ''))
-        print(f"   ✅ TP placed (TAKE_PROFIT-LIMIT trigger=${tp_price:,.2f} limit=${tp_limit_price:,.2f})", flush=True)
+        print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f})", flush=True)
     except Exception as e:
-        print(f"   ⚠️ TP TAKE_PROFIT failed: {e}", flush=True)
-        # Fallback: plain LIMIT for TP (sits on book above/below market — safe for TP)
-        try:
-            result = trading_exchange.fapiprivate_post_order({
-                'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
-                'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
-            })
-            tp_id = str(result.get('orderId', ''))
-            print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f})", flush=True)
-        except Exception as limit_err:
-            print(f"   ⚠️ TP LIMIT also failed: {limit_err}", flush=True)
+        print(f"   ⚠️ TP LIMIT failed: {e}", flush=True)
+
+    # === SL: software-monitored (no exchange order type works on demo) ===
+    print(f"   🛡️ SL tracked via software monitor @ ${sl_price:,.2f} (checked every 60s)", flush=True)
 
     # Track
     _active_sl_tp['symbol'] = symbol
-    _active_sl_tp['sl_id'] = sl_id
+    _active_sl_tp['sl_id'] = None  # No exchange order for SL
     _active_sl_tp['tp_id'] = tp_id
     _active_sl_tp['placed_at'] = time.time()
     _active_sl_tp['sl_price'] = sl_price
     _active_sl_tp['tp_price'] = tp_price
     _active_sl_tp['position_side'] = side
 
-    return sl_id, tp_id
+    return None, tp_id
 
 
+
+
+def check_software_sl(position):
+    """Check if software SL should trigger. Returns True if position was closed."""
+    if _active_sl_tp.get('symbol') != position['symbol']:
+        return False
+    sl = _active_sl_tp.get('sl_price')
+    side = _active_sl_tp.get('position_side')
+    if not sl or not side:
+        return False
+
+    try:
+        ticker = public_exchange.fetch_ticker(position['symbol'])
+        current = ticker['last']
+    except Exception:
+        return False  # Skip this check on error
+
+    triggered = False
+    if side == 'long' and current <= sl:
+        triggered = True
+    elif side == 'short' and current >= sl:
+        triggered = True
+
+    if triggered:
+        print(f"   🛡️ SOFTWARE SL TRIGGERED: price ${current:,.2f} hit SL ${sl:,.2f}", flush=True)
+        force_close_position(position['symbol'], f"Software SL at ${current:,.2f}")
+        return True
+
+    # Status log
+    if side == 'long':
+        sl_dist = (current - sl) / current * 100
+    else:
+        sl_dist = (sl - current) / current * 100
+    tp_str = " | TP on exchange" if _active_sl_tp.get('tp_id') else ""
+    print(f"   🛡️ SL monitor: ${current:,.2f} | SL {sl_dist:.1f}% away{tp_str}", flush=True)
+    return False
 
 
 def place_emergency_sl_tp(position):
@@ -1761,23 +1751,20 @@ async def main_loop():
                       f"Contracts: {position['contracts']} | "
                       f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)", flush=True)
 
-                # === Verify SL/TP orders still exist ===
+                # === Software SL check ===
+                if check_software_sl(position):
+                    had_position_last_cycle = False
+                    last_position_symbol = None
+                    continue
+
+                # === Verify TP LIMIT still on exchange ===
                 has_sl, has_tp, _ = has_sl_tp_orders(position['symbol'])
-                if not has_sl or not has_tp:
-                    if (_active_sl_tp.get('symbol') == position['symbol'] and
-                            _active_sl_tp.get('sl_id') and _active_sl_tp.get('tp_id')):
-                        age = time.time() - _active_sl_tp.get('placed_at', 0)
-                        if age < INTERVAL_MINUTES * 60 * 2:
-                            print(f"   ⚠️ SL/TP not visible yet (placed {age:.0f}s ago) — skipping re-place", flush=True)
-                        else:
-                            print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — re-placing...", flush=True)
-                            cancel_all_open_orders(position['symbol'])
-                            place_emergency_sl_tp(position)
-                    else:
-                        print(f"   🚨 Missing orders (SL: {'✅' if has_sl else '❌'}, TP: {'✅' if has_tp else '❌'}) — placing...", flush=True)
-                        place_emergency_sl_tp(position)
+                if not has_tp:
+                    print(f"   🚨 TP order missing — re-placing...", flush=True)
+                    cancel_all_open_orders(position['symbol'])
+                    place_emergency_sl_tp(position)
                 else:
-                    print(f"   ⏳ SL/TP confirmed — waiting for trigger", flush=True)
+                    print(f"   ⏳ TP on exchange ✅ | SL software monitor ✅", flush=True)
 
             else:
                 if had_position_last_cycle and last_position_symbol:
@@ -1849,8 +1836,23 @@ async def main_loop():
             print(f"   ❌ Loop error: {e}", flush=True)
             traceback.print_exc()
 
-        # Sleep until next cycle
-        await asyncio.sleep(INTERVAL_MINUTES * 60)
+        # Sleep: poll every 60s for software SL if position open, otherwise full interval
+        if had_position_last_cycle and _active_sl_tp.get('sl_price'):
+            total_wait = INTERVAL_MINUTES * 60
+            elapsed = 0
+            while elapsed < total_wait:
+                await asyncio.sleep(60)
+                elapsed += 60
+                pos = get_open_position()
+                if pos and _active_sl_tp.get('sl_price'):
+                    if check_software_sl(pos):
+                        had_position_last_cycle = False
+                        last_position_symbol = None
+                        break
+                elif not pos and had_position_last_cycle:
+                    break  # Position closed by TP
+        else:
+            await asyncio.sleep(INTERVAL_MINUTES * 60)
 
 
 # Crash-proof wrapper — restart on unexpected death
