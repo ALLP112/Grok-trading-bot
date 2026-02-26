@@ -555,7 +555,7 @@ def get_open_position():
 
 
 def has_sl_tp_orders(symbol):
-    """Check if a position has SL and TP orders (LIMIT orders count)."""
+    """Check if a position has SL and TP orders."""
     has_sl = False
     has_tp = False
     all_orders = []
@@ -567,17 +567,17 @@ def has_sl_tp_orders(symbol):
         for o in orders:
             otype = (o.get('type') or '').upper()
             oraw = (o.get('info', {}).get('type') or '').upper()
-            if otype in ('STOP_MARKET', 'STOP', 'LIMIT') or oraw in ('STOP_MARKET', 'STOP', 'LIMIT'):
-                # Match by order ID if we're tracking
-                oid = str(o.get('id', ''))
-                if oid and oid == _active_sl_tp.get('sl_id'):
-                    has_sl = True
-                elif oid and oid == _active_sl_tp.get('tp_id'):
-                    has_tp = True
-                elif otype in ('STOP_MARKET', 'STOP') or oraw in ('STOP_MARKET', 'STOP'):
-                    has_sl = True
-                elif otype in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT') or oraw in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
-                    has_tp = True
+            oid = str(o.get('id', ''))
+            # Match by tracked order ID first
+            if oid and oid == _active_sl_tp.get('sl_id'):
+                has_sl = True
+            elif oid and oid == _active_sl_tp.get('tp_id'):
+                has_tp = True
+            # Then by order type
+            elif otype in ('STOP_MARKET', 'STOP') or oraw in ('STOP_MARKET', 'STOP'):
+                has_sl = True
+            elif otype in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT') or oraw in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
+                has_tp = True
     except Exception as e:
         print(f"   🔍 fetch_open_orders failed: {e}", flush=True)
 
@@ -629,33 +629,57 @@ def reset_sl_tp_tracking():
 
 
 def place_sl_tp_orders(symbol, side, sl_price, tp_price, quantity):
-    """Place SL and TP as two LIMIT orders. Returns (sl_id, tp_id)."""
+    """Place SL and TP orders. Uses STOP (stop-limit) for SL and TAKE_PROFIT (stop-limit) for TP.
+    Falls back to LIMIT if stop types are blocked (-4120).
+    Returns (sl_id, tp_id)."""
     raw_sym = symbol_to_binance_raw(symbol)
     order_side = 'SELL' if side == 'long' else 'BUY'
     sl_id = None
     tp_id = None
 
-    # === SL LIMIT ORDER ===
+    # SL price buffer: slightly worse than trigger to ensure fill
+    if side == 'long':
+        sl_limit_price = round_price(sl_price * 0.998, symbol)  # Slightly below trigger
+        tp_limit_price = round_price(tp_price * 0.998, symbol)  # Slightly below trigger (selling)
+    else:
+        sl_limit_price = round_price(sl_price * 1.002, symbol)  # Slightly above trigger
+        tp_limit_price = round_price(tp_price * 1.002, symbol)  # Slightly above trigger (buying)
+
+    # === SL: STOP order (stop-limit) ===
     try:
         result = trading_exchange.fapiprivate_post_order({
-            'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
-            'price': str(sl_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
+            'symbol': raw_sym, 'side': order_side, 'type': 'STOP',
+            'stopPrice': str(sl_price), 'price': str(sl_limit_price),
+            'quantity': str(quantity), 'timeInForce': 'GTC',
+            'workingType': 'CONTRACT_PRICE',
         })
         sl_id = str(result.get('orderId', ''))
-        print(f"   ✅ SL placed (LIMIT @ ${sl_price:,.2f})", flush=True)
+        print(f"   ✅ SL placed (STOP-LIMIT trigger=${sl_price:,.2f} limit=${sl_limit_price:,.2f})", flush=True)
     except Exception as e:
-        print(f"   ⚠️ SL LIMIT failed: {e}", flush=True)
+        print(f"   ⚠️ SL STOP failed: {e}", flush=True)
 
-    # === TP LIMIT ORDER ===
+    # === TP: TAKE_PROFIT order (stop-limit) ===
     try:
         result = trading_exchange.fapiprivate_post_order({
-            'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
-            'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
+            'symbol': raw_sym, 'side': order_side, 'type': 'TAKE_PROFIT',
+            'stopPrice': str(tp_price), 'price': str(tp_limit_price),
+            'quantity': str(quantity), 'timeInForce': 'GTC',
+            'workingType': 'CONTRACT_PRICE',
         })
         tp_id = str(result.get('orderId', ''))
-        print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f})", flush=True)
+        print(f"   ✅ TP placed (TAKE_PROFIT-LIMIT trigger=${tp_price:,.2f} limit=${tp_limit_price:,.2f})", flush=True)
     except Exception as e:
-        print(f"   ⚠️ TP LIMIT failed: {e}", flush=True)
+        print(f"   ⚠️ TP TAKE_PROFIT failed: {e}", flush=True)
+        # Fallback: plain LIMIT for TP (sits on book above/below market — safe for TP)
+        try:
+            result = trading_exchange.fapiprivate_post_order({
+                'symbol': raw_sym, 'side': order_side, 'type': 'LIMIT',
+                'price': str(tp_price), 'quantity': str(quantity), 'timeInForce': 'GTC',
+            })
+            tp_id = str(result.get('orderId', ''))
+            print(f"   ✅ TP placed (LIMIT @ ${tp_price:,.2f})", flush=True)
+        except Exception as limit_err:
+            print(f"   ⚠️ TP LIMIT also failed: {limit_err}", flush=True)
 
     # Track
     _active_sl_tp['symbol'] = symbol
