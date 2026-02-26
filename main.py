@@ -780,6 +780,9 @@ def check_software_stop(position):
     try:
         ticker = public_exchange.fetch_ticker(position['symbol'])
         current = ticker['last']
+    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable, ccxt.RateLimitExceeded) as e:
+        # Rate limited — skip this check silently, next cycle will check again
+        return False
     except Exception as e:
         print(f"   ⚠️ Software stop: can't fetch price: {e}", flush=True)
         return False
@@ -2078,24 +2081,46 @@ async def main_loop():
             print(f"   ❌ Loop error: {e}", flush=True)
             traceback.print_exc()
 
-        # Adaptive sleep: check software stops every 30s, otherwise full interval
+        # Adaptive sleep: check software stops every 60s, otherwise full interval
         if _active_sl_tp.get('software_stop'):
             total_wait = INTERVAL_MINUTES * 60
             elapsed = 0
             while elapsed < total_wait:
-                await asyncio.sleep(30)
-                elapsed += 30
-                # Quick software stop check
-                pos = get_open_position()
-                if pos and _active_sl_tp.get('software_stop'):
-                    if check_software_stop(pos):
-                        # Position closed by software stop — break out to scan
-                        had_position_last_cycle = False
-                        last_position_symbol = None
-                        break
-                elif not pos and had_position_last_cycle:
-                    # Position closed (by SL/TP trigger or liquidation)
-                    break
+                await asyncio.sleep(60)
+                elapsed += 60
+                # Lightweight software stop check — only fetch price, not full position
+                if _active_sl_tp.get('software_stop') and _active_sl_tp.get('symbol'):
+                    try:
+                        ticker = public_exchange.fetch_ticker(_active_sl_tp['symbol'])
+                        current = ticker['last']
+                        sl = _active_sl_tp.get('sl_price')
+                        tp = _active_sl_tp.get('tp_price')
+                        side = _active_sl_tp.get('position_side')
+                        has_exchange_tp = _active_sl_tp.get('tp_id') is not None
+                        triggered = False
+
+                        if side == 'long' and sl and current <= sl:
+                            triggered = True
+                        elif side == 'short' and sl and current >= sl:
+                            triggered = True
+                        elif not has_exchange_tp and tp:
+                            if side == 'long' and current >= tp:
+                                triggered = True
+                            elif side == 'short' and current <= tp:
+                                triggered = True
+
+                        if triggered:
+                            print(f"   🛡️ SOFTWARE STOP TRIGGERED at ${current:,.2f}", flush=True)
+                            pos = get_open_position()
+                            if pos:
+                                force_close_position(pos['symbol'], f"Software stop at ${current:,.2f}")
+                            had_position_last_cycle = False
+                            last_position_symbol = None
+                            break
+                    except Exception:
+                        pass  # Rate limit or network — skip this check, try next cycle
+                else:
+                    break  # Software stop no longer active
         else:
             await asyncio.sleep(INTERVAL_MINUTES * 60)
 
