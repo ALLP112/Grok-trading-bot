@@ -1867,8 +1867,33 @@ async def main_loop():
 
             print(f"   🚫 Binance rate limit/ban in main loop: {ban_msg[:100]}", flush=True)
             print(f"   ⏳ Sleeping {wait:.0f}s before resuming...", flush=True)
-            await asyncio.sleep(wait)
-            continue  # Skip the normal sleep, retry immediately
+            # Still monitor SL during rate limit wait
+            if had_position_last_cycle and _active_sl_tp.get('sl_price') and _active_sl_tp.get('symbol'):
+                ban_elapsed = 0
+                while ban_elapsed < wait:
+                    await asyncio.sleep(min(60, wait - ban_elapsed))
+                    ban_elapsed += 60
+                    sl = _active_sl_tp.get('sl_price')
+                    side = _active_sl_tp.get('position_side')
+                    sym = _active_sl_tp.get('symbol')
+                    if sl and side and sym:
+                        try:
+                            ticker = public_exchange.fetch_ticker(sym)
+                            current = ticker['last']
+                            hit = (side == 'long' and current <= sl) or (side == 'short' and current >= sl)
+                            if hit:
+                                print(f"   🛡️ SOFTWARE SL TRIGGERED during ban wait: ${current:,.2f}", flush=True)
+                                pos = get_open_position()
+                                if pos:
+                                    force_close_position(pos['symbol'], f"Software SL at ${current:,.2f}")
+                                had_position_last_cycle = False
+                                last_position_symbol = None
+                                break
+                        except Exception:
+                            pass
+            else:
+                await asyncio.sleep(wait)
+            continue
 
         except Exception as e:
             print(f"   ❌ Loop error: {e}", flush=True)
@@ -1878,6 +1903,7 @@ async def main_loop():
         if had_position_last_cycle and _active_sl_tp.get('sl_price') and _active_sl_tp.get('symbol'):
             total_wait = INTERVAL_MINUTES * 60
             elapsed = 0
+            print(f"   ⏰ SL monitor active — checking every 60s for {total_wait // 60} min", flush=True)
             while elapsed < total_wait:
                 await asyncio.sleep(60)
                 elapsed += 60
@@ -1902,8 +1928,14 @@ async def main_loop():
                         had_position_last_cycle = False
                         last_position_symbol = None
                         break
-                except Exception:
-                    pass  # Rate limit or error — try again next cycle
+                    else:
+                        if side == 'long':
+                            sl_dist = (current - sl) / current * 100
+                        else:
+                            sl_dist = (sl - current) / current * 100
+                        print(f"   🛡️ SL check: ${current:,.2f} | SL {sl_dist:.1f}% away | {elapsed}s/{total_wait}s", flush=True)
+                except Exception as e:
+                    print(f"   ⚠️ SL check error (will retry): {str(e)[:80]}", flush=True)
         else:
             await asyncio.sleep(INTERVAL_MINUTES * 60)
 
