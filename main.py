@@ -527,9 +527,14 @@ def get_open_position():
             contracts = float(pos.get('contracts', 0) or 0)
             if contracts != 0:
                 lev = pos.get('leverage')
+                # Fallback: read from raw Binance response
+                if lev is None or lev == 0:
+                    lev = pos.get('info', {}).get('leverage')
                 try:
                     lev = int(float(lev)) if lev is not None else 1
                 except (ValueError, TypeError):
+                    lev = 1
+                if lev <= 0:
                     lev = 1
 
                 # Use ccxt's side field directly — contracts is always positive
@@ -581,43 +586,25 @@ def reset_sl_tp_tracking():
 
 
 def force_close_position(symbol, reason=""):
-    """Emergency close — market order to flatten position immediately.
-    Retries up to 5 times because this is the LAST safety net."""
+    """Market close a position. Does NOT log PnL — caller should use handle_position_close after."""
     for attempt in range(5):
         pos = get_open_position()
         if not pos or pos['symbol'] != symbol:
-            # Position already gone — clean up tracking and log
             reset_sl_tp_tracking()
-            _close_stale_trade_log(symbol)
-            return
+            return True  # Already closed
         close_side = 'sell' if pos['side'] == 'long' else 'buy'
         try:
-            exit_price = pos.get('entry_price', 0)
             trading_exchange.create_market_order(symbol, close_side, pos['contracts'])
-            print(f"   🔴 FORCE CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
-            # Log the close with realized PnL
-            try:
-                raw_sym = symbol_to_binance_raw(symbol)
-                incomes = trading_exchange.fapiprivate_get_income({
-                    'symbol': raw_sym, 'incomeType': 'REALIZED_PNL', 'limit': 1,
-                })
-                realized_pnl = float(incomes[-1].get('income', 0)) if incomes else 0
-                try:
-                    trades = trading_exchange.fetch_my_trades(symbol, limit=1)
-                    exit_price = float(trades[-1]['price']) if trades else exit_price
-                except Exception:
-                    pass
-                log_trade_close(exit_price, realized_pnl)
-            except Exception:
-                log_trade_close(exit_price, 0)
+            print(f"   🔴 CLOSED {pos['side'].upper()} {symbol} — {reason}", flush=True)
             cancel_all_open_orders(symbol)
             reset_sl_tp_tracking()
-            return
+            return True
         except Exception as e:
             print(f"   💀 Force-close attempt {attempt + 1}/5 failed: {e}", flush=True)
             if attempt < 4:
                 time.sleep(3)
-    print(f"   💀 CRITICAL: Could not force-close {symbol} after 5 attempts!", flush=True)
+    print(f"   💀 CRITICAL: Could not close {symbol} after 5 attempts!", flush=True)
+    return False
 
 
 def _close_stale_trade_log(symbol=None):
@@ -1668,14 +1655,17 @@ async def scan_and_trade():
 # ============================================================
 
 def handle_position_close(symbol):
+    # Wait for Binance to settle the trade
+    time.sleep(3)
     try:
         raw_sym = symbol_to_binance_raw(symbol)
         incomes = trading_exchange.fapiprivate_get_income({
             'symbol': raw_sym,
-            'incomeType': 'REALIZED_PNL', 'limit': 1,
+            'incomeType': 'REALIZED_PNL', 'limit': 5,
         })
         if incomes:
-            realized_pnl = float(incomes[-1].get('income', 0))
+            # Sum recent PnL entries (may be split across partial fills)
+            realized_pnl = sum(float(i.get('income', 0)) for i in incomes[-3:])
             try:
                 trades = trading_exchange.fetch_my_trades(symbol, limit=1)
                 exit_price = float(trades[-1]['price']) if trades else 0
@@ -1684,26 +1674,15 @@ def handle_position_close(symbol):
             log_trade_close(exit_price, realized_pnl)
             icon = '✅' if realized_pnl >= 0 else '❌'
             print(f"   {icon} Realized PnL: ${realized_pnl:+,.2f}", flush=True)
+        else:
+            print(f"   ⚠️ No realized PnL data from Binance", flush=True)
+            log_trade_close(0, 0)
     except Exception as e:
         print(f"   ⚠️ Could not fetch realized PnL: {e}", flush=True)
+        log_trade_close(0, 0)
 
-    # Cancel remaining orders (the other side of SL/TP that didn't trigger)
-    # First try tracked IDs directly
-    for order_id in [_active_sl_tp.get('sl_id'), _active_sl_tp.get('tp_id')]:
-        if order_id:
-            try:
-                raw_sym = symbol_to_binance_raw(symbol)
-                trading_exchange.fapiprivate_delete_order({
-                    'symbol': raw_sym,
-                    'orderId': order_id,
-                })
-            except Exception:
-                pass  # Already cancelled or triggered
-
-    # Then sweep anything remaining
+    # Cancel any remaining orders
     cancel_all_open_orders(symbol)
-
-    # Clear order tracking
     reset_sl_tp_tracking()
 
 
