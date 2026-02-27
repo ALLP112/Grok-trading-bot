@@ -526,6 +526,11 @@ def get_open_position():
         for pos in positions:
             contracts = float(pos.get('contracts', 0) or 0)
             if contracts != 0:
+                # Debug: see what leverage fields exist
+                raw_lev = pos.get('leverage')
+                info_lev = pos.get('info', {}).get('leverage')
+                print(f"   🔍 DEBUG leverage: pos.leverage={raw_lev} ({type(raw_lev).__name__}), info.leverage={info_lev} ({type(info_lev).__name__})", flush=True)
+
                 lev = pos.get('leverage')
                 # Fallback: read from raw Binance response
                 if lev is None or lev == 0:
