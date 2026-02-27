@@ -527,25 +527,24 @@ def get_open_position():
             contracts = float(pos.get('contracts', 0) or 0)
             if contracts != 0:
                 lev = pos.get('leverage')
-                info_keys = list(pos.get('info', {}).keys()) if pos.get('info') else []
-                print(f"   🔍 DEBUG pos keys: {list(pos.keys())[:15]}", flush=True)
-                print(f"   🔍 DEBUG info keys: {info_keys[:15]}", flush=True)
-                print(f"   🔍 DEBUG pos.leverage={pos.get('leverage')}, info.leverage={pos.get('info',{}).get('leverage')}", flush=True)
                 # Fallback: read from raw Binance response
                 if lev is None or lev == 0:
                     lev = pos.get('info', {}).get('leverage')
-                # Fallback 2: query Binance directly
+                # Fallback 2: compute from notional / initialMargin
                 if lev is None or lev == 0:
                     try:
-                        raw_sym = symbol_to_binance_raw(pos['symbol'])
-                        risk = trading_exchange.fapiprivate_get_positionrisk({'symbol': raw_sym})
-                        print(f"   🔍 DEBUG positionRisk for {raw_sym}: {risk[:1] if risk else 'empty'}", flush=True)
-                        for r in risk:
-                            if float(r.get('positionAmt', 0)) != 0:
-                                lev = r.get('leverage')
-                                break
-                    except Exception as lev_err:
-                        print(f"   🔍 DEBUG positionRisk error: {lev_err}", flush=True)
+                        notional = abs(float(pos.get('notional', 0) or 0))
+                        init_margin = float(pos.get('initialMargin', 0) or pos.get('info', {}).get('initialMargin', 0) or 0)
+                        if init_margin > 0 and notional > 0:
+                            lev = round(notional / init_margin)
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+                try:
+                    lev = int(float(lev)) if lev is not None else 1
+                except (ValueError, TypeError):
+                    lev = 1
+                if lev <= 0:
+                    lev = 1
                 try:
                     lev = int(float(lev)) if lev is not None else 1
                 except (ValueError, TypeError):
