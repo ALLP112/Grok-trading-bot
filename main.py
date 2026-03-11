@@ -1162,7 +1162,7 @@ Before picking a trade, think through each layer:
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model="grok-4-1-fast-reasoning",
+                model="grok-4.20-beta-0309-reasoning",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
                 max_tokens=1200
@@ -1310,7 +1310,7 @@ Think through each layer before deciding:
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model="grok-4-1-fast-reasoning",
+                model="grok-4.20-beta-0309-reasoning",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.5,
                 max_tokens=300
