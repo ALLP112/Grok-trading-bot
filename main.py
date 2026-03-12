@@ -19,16 +19,14 @@ from openai import AsyncOpenAI
 import ccxt
 from dotenv import load_dotenv
 
-print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4")
-print(f"{XAI_MODEL} + Risk-Based Sizing + Cross Margin", flush=True)
-
 load_dotenv()
 
 # === SETTINGS ===
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-beta-0309")
+XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "high")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
@@ -37,6 +35,9 @@ TRADING_RATE_LIMIT_MS = int(os.getenv("TRADING_RATE_LIMIT_MS", "1500"))
 ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "6"))
 TOP5_FULL_ENRICH = int(os.getenv("TOP5_FULL_ENRICH", "3"))
 API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "0.75"))
+
+print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
+print(f"{XAI_MODEL} | reasoning effort: {XAI_REASONING_EFFORT} + Risk-Based Sizing + Cross Margin", flush=True)
 
 # === CHECK KEYS ===
 missing = []
@@ -1167,15 +1168,7 @@ Before picking a trade, think through each layer:
 }}"""
 
     try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=XAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=1200
-            ),
-            timeout=120
-        )
+        text = await xai_json_call(prompt, timeout_seconds=120, max_output_tokens=1200)
     except asyncio.TimeoutError:
         print("   ⏰ Grok API timed out after 120s — holding", flush=True)
         return {"action": "hold", "confidence": 0, "reason": "API timeout"}
@@ -1184,7 +1177,6 @@ Before picking a trade, think through each layer:
         return {"action": "hold", "confidence": 0, "reason": f"API error: {e}"}
 
     try:
-        text = response.choices[0].message.content.strip()
         decision = parse_grok_json(text)
         if decision is None:
             print(f"   ⚠️ Could not parse Grok JSON — holding", flush=True)
@@ -1315,16 +1307,7 @@ Think through each layer before deciding:
 }}"""
 
     try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=XAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                max_tokens=300
-            ),
-            timeout=60
-        )
-        text = response.choices[0].message.content.strip()
+        text = await xai_json_call(prompt, timeout_seconds=60, max_output_tokens=300)
         result = parse_grok_json(text)
         if result and result.get('action') in ('keep', 'close'):
             return result
@@ -1720,7 +1703,7 @@ async def main_loop():
 
     print("🚀 High Leverage Top20 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
     print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Risk per trade: {MAX_RISK_PERCENT}% | Max margin: {MAX_MARGIN_PERCENT}%", flush=True)
-    print(f"🧠 xAI model: {XAI_MODEL} | Enrich top N: {ENRICH_TOP_N} | Full enrich slots: {TOP5_FULL_ENRICH}", flush=True)
+    print(f"🧠 xAI model: {XAI_MODEL} | Reasoning effort: {XAI_REASONING_EFFORT} | Enrich top N: {ENRICH_TOP_N} | Full enrich slots: {TOP5_FULL_ENRICH}", flush=True)
     print(f"🐢 Rate limits: public {PUBLIC_RATE_LIMIT_MS}ms | trading {TRADING_RATE_LIMIT_MS}ms | gap {API_SLEEP_SECONDS:.2f}s", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
