@@ -1,5 +1,5 @@
 """
-HIGH LEVERAGE TOP20 SCANNER — Grok 4.1 Thinking (Cross Margin)
+HIGH LEVERAGE TOP20 SCANNER — Grok 4.20 Heavy Reasoning (Cross Margin)
 Enhanced with technical indicators, multi-timeframe analysis, order book data
 Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 20 coins by volume, strictly one position at a time
@@ -20,7 +20,8 @@ import ccxt
 from dotenv import load_dotenv
 
 print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
-print("Grok 4.1 Thinking + Risk-Based Sizing + Cross Margin", flush=True)
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4")
+print(f"{XAI_MODEL} + Risk-Based Sizing + Cross Margin", flush=True)
 
 load_dotenv()
 
@@ -31,6 +32,11 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
+PUBLIC_RATE_LIMIT_MS = int(os.getenv("PUBLIC_RATE_LIMIT_MS", "1200"))
+TRADING_RATE_LIMIT_MS = int(os.getenv("TRADING_RATE_LIMIT_MS", "1500"))
+ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "6"))
+TOP5_FULL_ENRICH = int(os.getenv("TOP5_FULL_ENRICH", "3"))
+API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "0.75"))
 
 # === CHECK KEYS ===
 missing = []
@@ -49,6 +55,7 @@ client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 # PUBLIC exchange — live Binance for market data
 public_exchange = ccxt.binance({
     'enableRateLimit': True,
+    'rateLimit': PUBLIC_RATE_LIMIT_MS,
     'options': {'defaultType': 'future'},
 })
 print("✅ Connected to Binance LIVE for market data", flush=True)
@@ -58,6 +65,7 @@ trading_exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_API_SECRET,
     'enableRateLimit': True,
+    'rateLimit': TRADING_RATE_LIMIT_MS,
     'options': {
         'defaultType': 'future',
         'warnOnFetchOpenOrdersWithoutSymbol': False,
@@ -88,7 +96,6 @@ def get_cached_markets():
             attempt += 1
             try:
                 _markets_cache = public_exchange.load_markets()
-                trading_exchange.load_markets()
                 _markets_cache_time = time.time()
                 print(f"   🔄 Markets refreshed ({len(_markets_cache)} loaded)", flush=True)
                 return _markets_cache
@@ -863,9 +870,9 @@ async def get_top_candidates(n=20):
 async def deep_enrich(candidates, top_n=10):
     """
     Tiered enrichment to stay within rate limits:
-    - Top 5: Full (funding + 15m + 1h + 4h + OI + L/S + order book) ~7 calls each
-    - 6-10: Partial (funding + 15m + 1h) ~3 calls each
-    Total: ~50 calls with 0.3s gaps = ~15 seconds
+    - Top 3: Full (funding + 15m + 1h + 4h + OI + L/S + order book)
+    - Remaining slots: Partial (funding + 15m + 1h)
+    Defaults are intentionally conservative for Render/Binance shared IPs.
     """
     enriched = []
 
@@ -883,7 +890,7 @@ async def deep_enrich(candidates, top_n=10):
             btc_ta = analyze_candles(btc_candles)
             market_context['btc_rsi'] = btc_ta['rsi'] if btc_ta else 50
             market_context['btc_ema_trend'] = btc_ta['ema_trend'] if btc_ta else 'mixed'
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(API_SLEEP_SECONDS)
 
         eth_candles = public_exchange.fetch_ohlcv('ETH/USDT:USDT', '1h', limit=24)
         if eth_candles and len(eth_candles) >= 2:
@@ -891,36 +898,36 @@ async def deep_enrich(candidates, top_n=10):
             eth_24h_ago = eth_candles[0][1]
             market_context['eth_price'] = eth_now
             market_context['eth_24h_pct'] = (eth_now - eth_24h_ago) / eth_24h_ago * 100
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(API_SLEEP_SECONDS)
     except Exception as e:
         print(f"   ⚠️ Market context fetch error: {e}", flush=True)
 
     for i, c in enumerate(candidates[:top_n]):
         symbol = c['symbol']
-        is_top5 = i < 5
+        is_top5 = i < TOP5_FULL_ENRICH
 
         try:
             # Funding rate (all coins)
             funding_data = public_exchange.fetch_funding_rate(symbol)
             c['funding'] = funding_data.get('fundingRate', 0.0) if funding_data else 0.0
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(API_SLEEP_SECONDS)
 
             # 15-minute candles (all coins)
             candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
             c['ta_15m'] = analyze_candles(candles_15m)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(API_SLEEP_SECONDS)
 
             # 1-hour candles (all coins)
             candles_1h = public_exchange.fetch_ohlcv(symbol, '1h', limit=50)
             c['ta_1h'] = analyze_candles(candles_1h)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(API_SLEEP_SECONDS)
 
             # --- TOP 5 ONLY: deeper analysis ---
             if is_top5:
                 # 4h candles
                 candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=30)
                 c['ta_4h'] = analyze_candles(candles_4h)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(API_SLEEP_SECONDS)
 
                 # Open Interest
                 try:
@@ -931,7 +938,7 @@ async def deep_enrich(candidates, top_n=10):
                 except Exception:
                     c['open_interest'] = 0
                     c['oi_notional'] = 0
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(API_SLEEP_SECONDS)
 
                 # Long/Short Ratio
                 try:
@@ -962,12 +969,12 @@ async def deep_enrich(candidates, top_n=10):
                     c['long_pct'] = 50
                     c['short_pct'] = 50
                     c['ls_trend'] = 'stable'
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(API_SLEEP_SECONDS)
 
                 # Order book
                 ob = public_exchange.fetch_order_book(symbol, limit=20)
                 c['order_book'] = analyze_order_book(ob)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(API_SLEEP_SECONDS)
             else:
                 # Partial enrichment for coins 6-10
                 c['ta_4h'] = None
@@ -1162,7 +1169,7 @@ Before picking a trade, think through each layer:
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model="grok-4.20-beta-0309-reasoning",
+                model=XAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
                 max_tokens=1200
@@ -1310,7 +1317,7 @@ Think through each layer before deciding:
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
-                model="grok-4.20-beta-0309-reasoning",
+                model=XAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.5,
                 max_tokens=300
@@ -1526,7 +1533,7 @@ async def execute_trade(decision, balance):
         print(f"   🔥 OPENED {action.upper()} {symbol} @ ${current_price:,.2f} | {leverage}x Cross", flush=True)
         print(f"   📐 Notional: ${actual_notional:,.0f} | Margin: ${actual_margin:,.0f} | Risk: ${actual_risk:,.2f} ({MAX_RISK_PERCENT}%)", flush=True)
         print(f"   📊 Grok targets: SL ${sl:,.2f} (-{sl_dist_pct:.1f}%) | TP ${tp:,.2f} (+{tp_dist_pct:.1f}%) | R:R {rr:.1f}:1", flush=True)
-        print(f"   🤖 Grok will re-evaluate every {INTERVAL_MINUTES} min — no exchange SL/TP orders", flush=True)
+        print(f"   🤖 {XAI_MODEL} will re-evaluate every {INTERVAL_MINUTES} min — no exchange SL/TP orders", flush=True)
         print(f"   💡 {decision.get('reason', 'n/a')}", flush=True)
 
         return True
@@ -1573,7 +1580,7 @@ async def manage_position(position):
 
         # Enrich (position coin + top others for context)
         print(f"   🔬 Enriching market data for position evaluation...", flush=True)
-        enriched = await deep_enrich(candidates, 10)
+        enriched = await deep_enrich(candidates, ENRICH_TOP_N)
 
         balance = None
         for bal_attempt in range(3):
@@ -1621,7 +1628,7 @@ async def scan_and_trade():
             return False
 
         print(f"   🔬 Enriching top 10 with technicals + order book...", flush=True)
-        enriched = await deep_enrich(candidates, 10)
+        enriched = await deep_enrich(candidates, ENRICH_TOP_N)
 
         balance = None
         for bal_attempt in range(3):
@@ -1713,6 +1720,8 @@ async def main_loop():
 
     print("🚀 High Leverage Top20 Scanner is now RUNNING on DEMO (Cross Margin)", flush=True)
     print(f"📊 Scanning every {INTERVAL_MINUTES} minutes | Risk per trade: {MAX_RISK_PERCENT}% | Max margin: {MAX_MARGIN_PERCENT}%", flush=True)
+    print(f"🧠 xAI model: {XAI_MODEL} | Enrich top N: {ENRICH_TOP_N} | Full enrich slots: {TOP5_FULL_ENRICH}", flush=True)
+    print(f"🐢 Rate limits: public {PUBLIC_RATE_LIMIT_MS}ms | trading {TRADING_RATE_LIMIT_MS}ms | gap {API_SLEEP_SECONDS:.2f}s", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
     print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, multi-timeframe", flush=True)
