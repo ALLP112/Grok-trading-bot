@@ -53,6 +53,36 @@ if missing:
 
 client = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
+
+async def xai_json_call(prompt, timeout_seconds=90, max_output_tokens=800):
+    """Call xAI and return plain text for JSON parsing."""
+    response = await asyncio.wait_for(
+        client.responses.create(
+            model=XAI_MODEL,
+            reasoning={"effort": XAI_REASONING_EFFORT},
+            input=prompt,
+            max_output_tokens=max_output_tokens,
+        ),
+        timeout=timeout_seconds,
+    )
+
+    text = getattr(response, "output_text", None)
+    if text and str(text).strip():
+        return str(text).strip()
+
+    # Fallback for SDK variants that do not populate output_text
+    parts = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) in ("output_text", "text"):
+                value = getattr(content, "text", None)
+                if value:
+                    parts.append(str(value))
+    if parts:
+        return "\n".join(parts).strip()
+
+    raise RuntimeError("xAI returned no text output")
+
 # PUBLIC exchange — live Binance for market data
 public_exchange = ccxt.binance({
     'enableRateLimit': True,
