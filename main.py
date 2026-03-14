@@ -1,6 +1,6 @@
 """
 HIGH LEVERAGE TOP20 SCANNER — Grok 4.20 Heavy Reasoning (Cross Margin)
-Enhanced with technical indicators, multi-timeframe analysis, order book data
+Enhanced with 4h technical analysis, funding, OI, and order book data
 Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 20 coins by volume, strictly one position at a time
 Binance Demo Trading — runs 24/7 on Render.com
@@ -27,7 +27,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-beta-0309")
 XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "high")
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 PUBLIC_RATE_LIMIT_MS = int(os.getenv("PUBLIC_RATE_LIMIT_MS", "1200"))
@@ -900,35 +900,34 @@ async def get_top_candidates(n=20):
 
 async def deep_enrich(candidates, top_n=10):
     """
-    Tiered enrichment to stay within rate limits:
-    - Top 3: Full (funding + 15m + 1h + 4h + OI + L/S + order book)
-    - Remaining slots: Partial (funding + 15m + 1h)
-    Defaults are intentionally conservative for Render/Binance shared IPs.
+    4h-focused enrichment to reduce noise, API load, and prompt size:
+    - All enriched coins: funding + 4h technicals
+    - Top full-enrich slots: add OI + L/S + order book
     """
     enriched = []
 
-    # === MARKET CONTEXT: BTC + ETH ===
+    # === MARKET CONTEXT: BTC + ETH ON 4H ===
     market_context = {}
     try:
-        btc_candles = public_exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=24)
+        btc_candles = public_exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=30)
         if btc_candles and len(btc_candles) >= 2:
             btc_now = btc_candles[-1][4]
-            btc_24h_ago = btc_candles[0][1]
-            btc_4h_ago = btc_candles[-4][1] if len(btc_candles) >= 4 else btc_now
+            btc_24h_ago = btc_candles[-7][4] if len(btc_candles) >= 7 else btc_candles[0][4]
+            btc_4h_ago = btc_candles[-2][4] if len(btc_candles) >= 2 else btc_now
             market_context['btc_price'] = btc_now
-            market_context['btc_24h_pct'] = (btc_now - btc_24h_ago) / btc_24h_ago * 100
-            market_context['btc_4h_pct'] = (btc_now - btc_4h_ago) / btc_4h_ago * 100
+            market_context['btc_24h_pct'] = (btc_now - btc_24h_ago) / btc_24h_ago * 100 if btc_24h_ago else 0
+            market_context['btc_4h_pct'] = (btc_now - btc_4h_ago) / btc_4h_ago * 100 if btc_4h_ago else 0
             btc_ta = analyze_candles(btc_candles)
             market_context['btc_rsi'] = btc_ta['rsi'] if btc_ta else 50
             market_context['btc_ema_trend'] = btc_ta['ema_trend'] if btc_ta else 'mixed'
         await asyncio.sleep(API_SLEEP_SECONDS)
 
-        eth_candles = public_exchange.fetch_ohlcv('ETH/USDT:USDT', '1h', limit=24)
+        eth_candles = public_exchange.fetch_ohlcv('ETH/USDT:USDT', '4h', limit=30)
         if eth_candles and len(eth_candles) >= 2:
             eth_now = eth_candles[-1][4]
-            eth_24h_ago = eth_candles[0][1]
+            eth_24h_ago = eth_candles[-7][4] if len(eth_candles) >= 7 else eth_candles[0][4]
             market_context['eth_price'] = eth_now
-            market_context['eth_24h_pct'] = (eth_now - eth_24h_ago) / eth_24h_ago * 100
+            market_context['eth_24h_pct'] = (eth_now - eth_24h_ago) / eth_24h_ago * 100 if eth_24h_ago else 0
         await asyncio.sleep(API_SLEEP_SECONDS)
     except Exception as e:
         print(f"   ⚠️ Market context fetch error: {e}", flush=True)
@@ -943,23 +942,15 @@ async def deep_enrich(candidates, top_n=10):
             c['funding'] = funding_data.get('fundingRate', 0.0) if funding_data else 0.0
             await asyncio.sleep(API_SLEEP_SECONDS)
 
-            # 15-minute candles (all coins)
-            candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
-            c['ta_15m'] = analyze_candles(candles_15m)
+            # 4-hour candles (all enriched coins)
+            candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=50)
+            c['ta_4h'] = analyze_candles(candles_4h)
+            c['ta_15m'] = None
+            c['ta_1h'] = None
             await asyncio.sleep(API_SLEEP_SECONDS)
 
-            # 1-hour candles (all coins)
-            candles_1h = public_exchange.fetch_ohlcv(symbol, '1h', limit=50)
-            c['ta_1h'] = analyze_candles(candles_1h)
-            await asyncio.sleep(API_SLEEP_SECONDS)
-
-            # --- TOP 5 ONLY: deeper analysis ---
+            # --- TOP FULL-ENRICH SLOTS ONLY: deeper analysis ---
             if is_top5:
-                # 4h candles
-                candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=30)
-                c['ta_4h'] = analyze_candles(candles_4h)
-                await asyncio.sleep(API_SLEEP_SECONDS)
-
                 # Open Interest
                 try:
                     raw_symbol = symbol_to_binance_raw(symbol)
@@ -1007,8 +998,6 @@ async def deep_enrich(candidates, top_n=10):
                 c['order_book'] = analyze_order_book(ob)
                 await asyncio.sleep(API_SLEEP_SECONDS)
             else:
-                # Partial enrichment for coins 6-10
-                c['ta_4h'] = None
                 c['open_interest'] = 0
                 c['oi_notional'] = 0
                 c['long_short_ratio'] = 1.0
@@ -1021,9 +1010,9 @@ async def deep_enrich(candidates, top_n=10):
             print(f"   ⚠️ Rate limited during enrichment — pausing 30s: {e}", flush=True)
             await asyncio.sleep(30)
             c['funding'] = c.get('funding', 0.0)
-            c['ta_15m'] = c.get('ta_15m')
-            c['ta_1h'] = c.get('ta_1h')
-            c['ta_4h'] = None
+            c['ta_15m'] = None
+            c['ta_1h'] = None
+            c['ta_4h'] = c.get('ta_4h')
             c['open_interest'] = 0
             c['oi_notional'] = 0
             c['long_short_ratio'] = 1.0
@@ -1034,9 +1023,9 @@ async def deep_enrich(candidates, top_n=10):
         except Exception as e:
             print(f"   ⚠️ Enrich error on {symbol}: {e}", flush=True)
             c['funding'] = c.get('funding', 0.0)
-            c['ta_15m'] = c.get('ta_15m')
-            c['ta_1h'] = c.get('ta_1h')
-            c['ta_4h'] = None
+            c['ta_15m'] = None
+            c['ta_1h'] = None
+            c['ta_4h'] = c.get('ta_4h')
             c['open_interest'] = 0
             c['oi_notional'] = 0
             c['long_short_ratio'] = 1.0
@@ -1069,30 +1058,18 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
 
     lines = []
     for c in candidates:
-        ta15 = c.get('ta_15m')
-        ta1h = c.get('ta_1h')
         ta4h = c.get('ta_4h')
         ob = c.get('order_book')
         line = f"\n--- {c['symbol']} ---\n"
         line += f"Price: ${c['price']:,.2f} | 24h: {c['change24h']:+.2f}% | Vol: ${c['volume'] / 1e9:.1f}B | Funding: {c.get('funding', 0) * 100:.4f}%\n"
-
-        # Positioning data
         line += f"OI: ${c.get('oi_notional', 0) / 1e6:.1f}M | L/S Ratio: {c.get('long_short_ratio', 1.0):.2f} ({c.get('long_pct', 50):.0f}%L/{c.get('short_pct', 50):.0f}%S) | L/S Trend: {c.get('ls_trend', 'stable')}\n"
 
-        if ta15:
-            line += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | "
-            line += f"ATR {ta15['atr_pct']:.2f}% | Vol×{ta15['vol_ratio']:.1f} | "
-            line += f"BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']} | "
-            line += f"Mom5: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d} | "
-            line += f"S/R: ${ta15['recent_low']:,.2f}-${ta15['recent_high']:,.2f}\n"
-        if ta1h:
-            line += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | "
-            line += f"ATR {ta1h['atr_pct']:.2f}% | Vol×{ta1h['vol_ratio']:.1f} | "
-            line += f"Mom5: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
         if ta4h:
-            line += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
+            line += f"4h: RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
             line += f"ATR {ta4h['atr_pct']:.2f}% | Vol×{ta4h['vol_ratio']:.1f} | "
-            line += f"Mom5: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
+            line += f"BB {ta4h['bb_position']} | VWAP {ta4h['price_vs_vwap']} | "
+            line += f"Mom5: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d} | "
+            line += f"S/R: ${ta4h['recent_low']:,.2f}-${ta4h['recent_high']:,.2f}\n"
         if ob:
             line += f"Book: {ob['imbalance_label']} (imb {ob['imbalance']:+.2f}) | "
             line += f"Spread {ob['spread_pct']:.4f}% | "
@@ -1104,7 +1081,7 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
     risk_budget = balance * MAX_RISK_PERCENT / 100
 
     prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader.
-You find asymmetric setups with favorable risk/reward. You prefer to be in a trade when there's an edge rather than sitting on the sidelines.
+You trade from the 4-hour chart and ignore low-timeframe noise. Be selective and only take clear, asymmetric setups.
 
 ═══ MACRO CONTEXT ═══
 {market_str if market_str else "Market data unavailable."}
@@ -1120,71 +1097,59 @@ Position sizing is automatic — tighter SL = bigger position, wider SL = smalle
 ═══ TOP {len(candidates)} CANDIDATES ═══
 {data_str}
 
-═══ FIRST PRINCIPLES ANALYSIS ═══
+═══ 4H FIRST-PRINCIPLES ANALYSIS ═══
 Before picking a trade, think through each layer:
 
 **1. MACRO REGIME**
-- Check BTC trend. In strong BTC downtrends, prefer shorts or reduce leverage on longs.
-- BTC choppy/mixed = trade individual coin setups on their own merit with moderate leverage.
-- Don't let a neutral BTC prevent you from taking good altcoin setups.
+- Check BTC trend first. In strong BTC downtrends, prefer shorts or lighter leverage on longs.
+- BTC choppy/mixed = trade individual coin setups on their own merit.
+- Neutral BTC should not block a strong 4h setup.
 
 **2. POSITIONING & CROWDING**
-- Long/Short ratio: If >65% are long, contrarian shorts have edge. If <35% are long, look for squeeze longs.
-- L/S trend: Rapidly increasing longs = potential FOMO, adds weight to short thesis but isn't a veto.
-- Open Interest: Rising OI + rising price = genuine trend. Rising OI + falling price = shorts building.
-- Use positioning as an edge multiplier, not a trade filter.
+- Long/Short ratio: If >65% are long, contrarian shorts have more edge. If <35% are long, squeeze longs have more edge.
+- Rising OI + rising price = genuine trend. Rising OI + falling price = shorts building.
+- Funding and positioning should strengthen the trade thesis, not replace it.
 
-**3. FUNDING RATE AS SENTIMENT**
-- Very positive funding (>0.05%) = crowded long, adds edge to shorts but doesn't block longs.
-- Very negative funding (<-0.05%) = crowded short, squeeze longs have extra edge.
-- Near zero = neutral, trade on technicals alone.
-- Funding is a confidence booster, not a gate.
+**3. 4H TREND & STRUCTURE**
+- This bot trades from the 4h chart. Base the decision primarily on the 4h EMA trend, RSI, momentum, and price structure.
+- Favor clean directional 4h trends with constructive momentum.
+- If the 4h chart is flat, conflicted, or sloppy, HOLD unless the edge is unusually strong.
 
-**4. MULTI-TIMEFRAME TREND ALIGNMENT**
-- Best trades: 4h + 1h + 15m ALL agree on direction.
-- Good trades: 2 of 3 timeframes agree — this is enough to enter with moderate leverage.
-- 15m pullback against 1h/4h trend = potential entry opportunity, not a disqualifier.
-- VWAP position is a tiebreaker, not a dealbreaker.
+**4. VOLATILITY & MOMENTUM**
+- ATR tells you expected movement range. Low ATR means tighter SL, not automatically no trade.
+- Bollinger position and VWAP help show whether price is extended or still in a healthy trend.
+- Volume ratio >1.5 adds conviction. Candle streaks that are too stretched may call for tighter SL or lighter leverage.
 
-**5. VOLATILITY & MOMENTUM**
-- ATR tells you expected movement range. Low ATR = use tighter SL, not a reason to skip.
-- Bollinger squeeze (price near mid, bands tight) = breakout imminent. Good setup.
-- Volume ratio >1.5 adds conviction. <0.8 means lighter position, not no position.
-- Candle streak: +5 or more = consider counter-trend trades or tighter SL, but don't skip entirely.
+**5. ORDER FLOW (top full-enrich coins)**
+- Buy-heavy imbalance + bullish 4h structure = stronger long confirmation.
+- Sell-heavy imbalance + weak 4h structure = stronger short confirmation.
+- Order book is confirmation only, not the main thesis.
 
-**6. ORDER FLOW (top 5 coins)**
-- Buy-heavy imbalance + bullish trend = strong confirmation for longs.
-- Sell-heavy imbalance + rising price = hidden distribution, be cautious.
-- Large bid/ask walls act as magnets — price tends to test them.
+**6. STOP LOSS PLACEMENT (critical)**
+- SL should be where the 4h thesis is invalidated, not an arbitrary %.
+- For longs: below meaningful 4h support / recent low / lower band.
+- For shorts: above meaningful 4h resistance / recent high / upper band.
+- Must allow normal volatility and usually be at least around 1x ATR from entry.
 
-**7. STOP LOSS PLACEMENT (critical)**
-- SL should be at a level where your thesis is INVALIDATED, not just an arbitrary %.
-- Below recent support (for longs) or above recent resistance (for shorts).
-- Below/above Bollinger lower/upper band.
-- Must give enough room for normal volatility (at least 1x ATR from entry).
+**7. TAKE PROFIT PLACEMENT**
+- Place TP at the next meaningful 4h level.
+- Minimum 2:1 R:R ratio — this is NON-NEGOTIABLE.
 
-**8. TAKE PROFIT PLACEMENT**
-- At the next meaningful resistance (for longs) or support (for shorts).
-- Near the opposite Bollinger band.
-- Near recent high/low as measured by 4h or 1h timeframe.
-- Minimum 2:1 R:R ratio — this is NON-NEGOTIABLE. The system will auto-correct if you violate this.
-
-**9. WHEN TO HOLD**
-- Hold if ALL timeframes conflict with no clear direction.
-- Hold if a coin just pumped 20%+ — usually too late for a clean entry.
-- Otherwise, look for the best available setup. There's usually something tradeable in the top 20.
+**8. WHEN TO HOLD**
+- HOLD when the 4h chart does not offer a clean directional edge.
+- HOLD when the move already looks too extended for a fresh entry.
+- You do not need to trade every cycle. Quality matters more than frequency.
 
 ═══ RULES ═══
 - CRITICAL: "symbol" must be EXACTLY one of the symbols listed above.
 - For LONG: stop_loss BELOW entry, take_profit ABOVE entry.
 - For SHORT: stop_loss ABOVE entry, take_profit BELOW entry.
 - SL at a technical invalidation level (0.5-5% from entry).
-- TP at minimum 2:1 R:R (the system enforces this — don't even try 1:1).
-- Leverage 15-20x when 3/3 timeframes align with confirming positioning/funding.
-- Leverage 7-12x when 2/3 timeframes align — this is your bread and butter.
-- Leverage 3-5x for weaker setups with one strong signal.
+- TP at minimum 2:1 R:R.
+- Leverage 10-15x only for the cleanest 4h setups with strong confirmation.
+- Leverage 5-10x for solid 4h setups.
+- Leverage 3-5x for weaker but still valid setups.
 - Confidence ≥ 0.60 to trade. Below 0.60 = hold.
-- You should be trading more often than not. Find the best setup available.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1198,7 +1163,7 @@ Before picking a trade, think through each layer:
 }}"""
 
     try:
-        text = await xai_json_call(prompt, timeout_seconds=120, max_output_tokens=1200)
+        text = await xai_json_call(prompt, timeout_seconds=120, max_output_tokens=700)
     except asyncio.TimeoutError:
         print("   ⏰ Grok API timed out after 120s — holding", flush=True)
         return {"action": "hold", "confidence": 0, "reason": "API timeout"}
@@ -1212,7 +1177,6 @@ Before picking a trade, think through each layer:
             print(f"   ⚠️ Could not parse Grok JSON — holding", flush=True)
             print(f"   [RAW]: {text[:200]}", flush=True)
             return {"action": "hold", "confidence": 0, "reason": "JSON parse failure"}
-        # If Grok says hold, skip symbol validation entirely
         if decision.get('action', '').lower() == 'hold':
             return decision
         raw_symbol = decision.get('symbol', '')
@@ -1235,7 +1199,6 @@ Before picking a trade, think through each layer:
         return {"action": "hold", "confidence": 0}
 
 
-
 # ============================================================
 #  GROK POSITION MANAGEMENT
 # ============================================================
@@ -1250,38 +1213,33 @@ async def grok_evaluate_position(position, candidates, balance):
     pnl_pct = (pnl / position['notional'] * 100) if position['notional'] else 0
     leverage = position['leverage']
 
-    # Find this coin's enriched data
     coin_data = None
     for c in candidates:
         if c['symbol'] == symbol:
             coin_data = c
             break
 
-    # Build market data string for the position's coin
     coin_str = ""
     if coin_data:
-        ta15 = coin_data.get('ta_15m')
-        ta1h = coin_data.get('ta_1h')
         ta4h = coin_data.get('ta_4h')
         ob = coin_data.get('order_book')
         coin_str = f"Price: ${coin_data['price']:,.2f} | 24h: {coin_data['change24h']:+.2f}% | Funding: {coin_data.get('funding', 0) * 100:.4f}%\n"
         coin_str += f"OI: ${coin_data.get('oi_notional', 0) / 1e6:.1f}M | L/S: {coin_data.get('long_short_ratio', 1.0):.2f}\n"
-        if ta15:
-            coin_str += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | Mom: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d}\n"
-        if ta1h:
-            coin_str += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | Mom: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
         if ta4h:
-            coin_str += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | Mom: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
+            coin_str += f"4h: RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
+            coin_str += f"ATR {ta4h['atr_pct']:.2f}% | BB {ta4h['bb_position']} | VWAP {ta4h['price_vs_vwap']} | "
+            coin_str += f"Mom: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d} | "
+            coin_str += f"S/R: ${ta4h['recent_low']:,.2f}-${ta4h['recent_high']:,.2f}\n"
         if ob:
             coin_str += f"Book: {ob['imbalance_label']} (imb {ob['imbalance']:+.2f}) | Spread {ob['spread_pct']:.4f}%\n"
 
-    # Market context
     mc = candidates[0].get('market_context', {}) if candidates else {}
     market_str = ""
     if mc:
         market_str = f"BTC: ${mc.get('btc_price', 0):,.0f} | 4h: {mc.get('btc_4h_pct', 0):+.2f}% | 24h: {mc.get('btc_24h_pct', 0):+.2f}% | RSI: {mc.get('btc_rsi', 50):.0f} | Trend: {mc.get('btc_ema_trend', 'mixed')}"
 
     prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader managing an open position.
+This bot now manages positions from the 4-hour chart. Ignore minor intrahour noise.
 
 ═══ MACRO ═══
 {market_str if market_str else "Unavailable"}
@@ -1294,41 +1252,36 @@ Notional: ${position['notional']:,.0f} | Contracts: {position['contracts']}
 ═══ CURRENT MARKET DATA FOR {symbol} ═══
 {coin_str if coin_str else "Data unavailable — close if uncertain."}
 
-═══ FIRST PRINCIPLES POSITION MANAGEMENT ═══
+═══ 4H POSITION MANAGEMENT ═══
 Think through each layer before deciding:
 
 **1. IS THE MACRO STILL SUPPORTIVE?**
-- If you're long and BTC is now in a clear downtrend (not just a dip), that weakens your thesis.
-- BTC choppy/sideways is fine for altcoin positions — don't close just because BTC isn't pumping.
-- A macro shift against your direction is a strong close signal, but a neutral macro is not.
+- If you're long and BTC is in a clear 4h downtrend, that weakens your thesis.
+- Neutral or choppy BTC is not enough reason by itself to close.
 
 **2. HAS THE POSITIONING/CROWDING STORY CHANGED?**
-- If you entered a squeeze play (e.g. short squeeze on negative funding), is the funding still negative? Has it normalized?
-- If L/S ratio has flipped against your thesis, that's worth noting but not an automatic close.
-- Positioning that was your edge disappearing = weaker conviction to hold.
+- If funding or L/S positioning was part of the edge, has that edge disappeared?
+- Positioning weakening matters, but only if it also hurts the 4h thesis.
 
-**3. ARE THE TRENDS STILL ALIGNED?**
-- Check if the multi-timeframe alignment that got you into this trade still holds.
-- One timeframe flipping is normal noise. Two or more flipping = thesis weakening.
-- 15m noise against your position is fine if 1h and 4h still support you.
+**3. IS THE 4H STRUCTURE STILL INTACT?**
+- This is the main question. Keep the position if the 4h trend structure is still intact.
+- Close if the 4h EMA structure, momentum, or price structure clearly breaks against the trade.
+- Do not close just because of small noise between hourly checks.
 
 **4. MOMENTUM & PRICE ACTION**
-- Is momentum still in your favor or has it clearly shifted?
-- Candle streaks extending in your direction = let it run.
-- Momentum flipping on 1h+ timeframes = consider closing.
-- Price breaking below key EMAs (for longs) or above (for shorts) is meaningful.
+- Momentum still in your favor = usually keep.
+- Price losing key 4h support (for longs) or reclaiming key 4h resistance (for shorts) is meaningful.
+- A stretched move with fading momentum can justify taking profit or closing.
 
 **5. PROFIT & LOSS REALITY**
-- Nice profit (>3-5% leveraged)? Consider taking it — don't be greedy, but don't panic-close small gains either.
-- Moderate loss (-3% to -8% leveraged)? Only close if the thesis is also broken. Losses alone aren't a reason to close if the setup is still valid.
-- Large loss (>-10% leveraged)? Close unless you have very strong conviction the thesis is intact.
-- Small loss or small gain? Focus on whether the thesis holds, not the P&L.
+- Good profit and weakening 4h momentum can justify closing.
+- Moderate loss alone is not enough to close if the 4h thesis still holds.
+- Large loss with broken 4h thesis = close.
 
 **6. OVERALL JUDGMENT**
-- The default should be to KEEP if nothing has fundamentally changed.
-- Don't close on minor pullbacks or noise — these are leveraged positions, some volatility is expected.
-- CLOSE when your original reason for entering is no longer valid, or when a clear better opportunity exists.
-- You're re-evaluated every {INTERVAL_MINUTES} minutes, so there's no urgency to close on weak signals.
+- Default to KEEP if the 4h thesis still holds.
+- CLOSE when the original 4h reason for entry is no longer valid.
+- You're re-evaluated every {INTERVAL_MINUTES} minutes, but the thesis is based on 4h structure, so don't react to noise.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1337,7 +1290,7 @@ Think through each layer before deciding:
 }}"""
 
     try:
-        text = await xai_json_call(prompt, timeout_seconds=60, max_output_tokens=300)
+        text = await xai_json_call(prompt, timeout_seconds=60, max_output_tokens=220)
         result = parse_grok_json(text)
         if result and result.get('action') in ('keep', 'close'):
             return result
@@ -1737,7 +1690,7 @@ async def main_loop():
     print(f"🐢 Rate limits: public {PUBLIC_RATE_LIMIT_MS}ms | trading {TRADING_RATE_LIMIT_MS}ms | gap {API_SLEEP_SECONDS:.2f}s", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
-    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, multi-timeframe", flush=True)
+    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, 4h-focused", flush=True)
     print("=" * 60, flush=True)
 
     # Balance fetch with retry
