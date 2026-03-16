@@ -1,6 +1,6 @@
 """
 HIGH LEVERAGE TOP20 SCANNER — Grok 4.20 Heavy Reasoning (Cross Margin)
-5-minute scalping with 15m/1h/4h multi-timeframe analysis, funding, OI, and order book data
+15-minute scalping with 15m/1h/4h multi-timeframe analysis, funding, OI, and order book data
 Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 20 coins by volume, strictly one position at a time
 Binance Demo Trading — runs 24/7 on Render.com
@@ -27,14 +27,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-beta-0309")
 XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "high")
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "5"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 PUBLIC_RATE_LIMIT_MS = int(os.getenv("PUBLIC_RATE_LIMIT_MS", "1200"))
 TRADING_RATE_LIMIT_MS = int(os.getenv("TRADING_RATE_LIMIT_MS", "1500"))
-ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "6"))
+ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "5"))
 TOP5_FULL_ENRICH = int(os.getenv("TOP5_FULL_ENRICH", "3"))
-API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "0.75"))
+API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "1.0"))
 
 print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
 print(f"{XAI_MODEL} | reasoning effort: {XAI_REASONING_EFFORT} + Risk-Based Sizing + Cross Margin", flush=True)
@@ -898,10 +898,10 @@ async def get_top_candidates(n=20):
     return candidates[:n]
 
 
-async def deep_enrich(candidates, top_n=10):
+async def deep_enrich(candidates, top_n=5):
     """
-    4h-focused enrichment to reduce noise, API load, and prompt size:
-    - All enriched coins: funding + 4h technicals
+    Multi-timeframe enrichment for scalping:
+    - All enriched coins: funding + 15m + 1h + 4h technicals
     - Top full-enrich slots: add OI + L/S + order book
     """
     enriched = []
@@ -937,16 +937,24 @@ async def deep_enrich(candidates, top_n=10):
         is_top5 = i < TOP5_FULL_ENRICH
 
         try:
-            # Funding rate (all coins)
+            # Funding rate
             funding_data = public_exchange.fetch_funding_rate(symbol)
             c['funding'] = funding_data.get('fundingRate', 0.0) if funding_data else 0.0
             await asyncio.sleep(API_SLEEP_SECONDS)
 
-            # 4-hour candles (all enriched coins)
+            # 15-minute candles (primary scalping timeframe)
+            candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
+            c['ta_15m'] = analyze_candles(candles_15m)
+            await asyncio.sleep(API_SLEEP_SECONDS)
+
+            # 1-hour candles (context)
+            candles_1h = public_exchange.fetch_ohlcv(symbol, '1h', limit=50)
+            c['ta_1h'] = analyze_candles(candles_1h)
+            await asyncio.sleep(API_SLEEP_SECONDS)
+
+            # 4-hour candles (macro direction)
             candles_4h = public_exchange.fetch_ohlcv(symbol, '4h', limit=50)
             c['ta_4h'] = analyze_candles(candles_4h)
-            c['ta_15m'] = None
-            c['ta_1h'] = None
             await asyncio.sleep(API_SLEEP_SECONDS)
 
             # --- TOP FULL-ENRICH SLOTS ONLY: deeper analysis ---
@@ -1058,18 +1066,28 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
 
     lines = []
     for c in candidates:
+        ta15 = c.get('ta_15m')
+        ta1h = c.get('ta_1h')
         ta4h = c.get('ta_4h')
         ob = c.get('order_book')
         line = f"\n--- {c['symbol']} ---\n"
         line += f"Price: ${c['price']:,.2f} | 24h: {c['change24h']:+.2f}% | Vol: ${c['volume'] / 1e9:.1f}B | Funding: {c.get('funding', 0) * 100:.4f}%\n"
         line += f"OI: ${c.get('oi_notional', 0) / 1e6:.1f}M | L/S Ratio: {c.get('long_short_ratio', 1.0):.2f} ({c.get('long_pct', 50):.0f}%L/{c.get('short_pct', 50):.0f}%S) | L/S Trend: {c.get('ls_trend', 'stable')}\n"
 
+        if ta15:
+            line += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | "
+            line += f"ATR {ta15['atr_pct']:.2f}% | Vol×{ta15['vol_ratio']:.1f} | "
+            line += f"BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']} | "
+            line += f"Mom5: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d} | "
+            line += f"S/R: ${ta15['recent_low']:,.2f}-${ta15['recent_high']:,.2f}\n"
+        if ta1h:
+            line += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | "
+            line += f"ATR {ta1h['atr_pct']:.2f}% | Vol×{ta1h['vol_ratio']:.1f} | "
+            line += f"Mom5: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
         if ta4h:
-            line += f"4h: RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
+            line += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
             line += f"ATR {ta4h['atr_pct']:.2f}% | Vol×{ta4h['vol_ratio']:.1f} | "
-            line += f"BB {ta4h['bb_position']} | VWAP {ta4h['price_vs_vwap']} | "
-            line += f"Mom5: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d} | "
-            line += f"S/R: ${ta4h['recent_low']:,.2f}-${ta4h['recent_high']:,.2f}\n"
+            line += f"Mom5: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
         if ob:
             line += f"Book: {ob['imbalance_label']} (imb {ob['imbalance']:+.2f}) | "
             line += f"Spread {ob['spread_pct']:.4f}% | "
@@ -1143,7 +1161,7 @@ Think through each layer quickly:
 **8. WHEN TO HOLD**
 - HOLD when 15m has no clear momentum or direction.
 - HOLD when all timeframes conflict with no clean signal.
-- But you're checked every 5 minutes — if there's a reasonable setup, take it. Don't wait for perfection.
+- But you're checked every {INTERVAL_MINUTES} minutes — if there's a reasonable setup, take it. Don't wait for perfection.
 
 ═══ RULES ═══
 - CRITICAL: "symbol" must be EXACTLY one of the symbols listed above.
@@ -1297,7 +1315,7 @@ Think through each layer quickly — you're checked every {INTERVAL_MINUTES} min
 **6. OVERALL**
 - Scalps are meant to be fast. If the momentum that got you in is gone, get out.
 - Don't hold a scalp hoping it turns into a swing trade.
-- When in doubt on a scalp, close. You'll get another setup in 5 minutes.
+- When in doubt on a scalp, close. You'll get another setup in {INTERVAL_MINUTES} minutes.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1609,7 +1627,7 @@ async def scan_and_trade():
             print(f"   ⚠️ No candidates available — skipping this cycle", flush=True)
             return False
 
-        print(f"   🔬 Enriching top 10 with technicals + order book...", flush=True)
+        print(f"   🔬 Enriching top {ENRICH_TOP_N} with 15m/1h/4h technicals + order book...", flush=True)
         enriched = await deep_enrich(candidates, ENRICH_TOP_N)
 
         balance = None
@@ -1706,7 +1724,7 @@ async def main_loop():
     print(f"🐢 Rate limits: public {PUBLIC_RATE_LIMIT_MS}ms | trading {TRADING_RATE_LIMIT_MS}ms | gap {API_SLEEP_SECONDS:.2f}s", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
-    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, 5min scalping", flush=True)
+    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, 15min scalping", flush=True)
     print("=" * 60, flush=True)
 
     # Balance fetch with retry
