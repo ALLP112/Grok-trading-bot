@@ -1,6 +1,6 @@
 """
 HIGH LEVERAGE TOP20 SCANNER — Grok 4.20 Heavy Reasoning (Cross Margin)
-15-minute scalping with 15m/1h/4h multi-timeframe analysis, funding, OI, and order book data
+1-hour primary with 15m/4h context, multi-timeframe analysis, funding, OI, and order book data
 Risk-based position sizing: size = risk_budget / SL_distance
 Scans top 20 coins by volume, strictly one position at a time
 Binance Demo Trading — runs 24/7 on Render.com
@@ -27,7 +27,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.20-multi-agent-beta-0309")
 XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "high")
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
 MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 PUBLIC_RATE_LIMIT_MS = int(os.getenv("PUBLIC_RATE_LIMIT_MS", "1200"))
@@ -900,7 +900,7 @@ async def get_top_candidates(n=20):
 
 async def deep_enrich(candidates, top_n=5):
     """
-    Multi-timeframe enrichment for scalping:
+    Multi-timeframe enrichment for 1h trading:
     - All enriched coins: funding + 15m + 1h + 4h technicals
     - Top full-enrich slots: add OI + L/S + order book
     """
@@ -942,7 +942,7 @@ async def deep_enrich(candidates, top_n=5):
             c['funding'] = funding_data.get('fundingRate', 0.0) if funding_data else 0.0
             await asyncio.sleep(API_SLEEP_SECONDS)
 
-            # 15-minute candles (primary scalping timeframe)
+            # 15-minute candles (entry timing)
             candles_15m = public_exchange.fetch_ohlcv(symbol, '15m', limit=50)
             c['ta_15m'] = analyze_candles(candles_15m)
             await asyncio.sleep(API_SLEEP_SECONDS)
@@ -1076,17 +1076,16 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
 
         if ta15:
             line += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | "
-            line += f"ATR {ta15['atr_pct']:.2f}% | Vol×{ta15['vol_ratio']:.1f} | "
-            line += f"BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']} | "
             line += f"Mom5: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d} | "
-            line += f"S/R: ${ta15['recent_low']:,.2f}-${ta15['recent_high']:,.2f}\n"
+            line += f"Vol×{ta15['vol_ratio']:.1f} | BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']}\n"
         if ta1h:
             line += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | "
             line += f"ATR {ta1h['atr_pct']:.2f}% | Vol×{ta1h['vol_ratio']:.1f} | "
-            line += f"Mom5: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
+            line += f"BB {ta1h['bb_position']} | VWAP {ta1h['price_vs_vwap']} | "
+            line += f"Mom5: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d} | "
+            line += f"S/R: ${ta1h['recent_low']:,.2f}-${ta1h['recent_high']:,.2f}\n"
         if ta4h:
             line += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
-            line += f"ATR {ta4h['atr_pct']:.2f}% | Vol×{ta4h['vol_ratio']:.1f} | "
             line += f"Mom5: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
         if ob:
             line += f"Book: {ob['imbalance_label']} (imb {ob['imbalance']:+.2f}) | "
@@ -1098,8 +1097,8 @@ Market regime: {'RISK-ON (BTC bullish)' if mc.get('btc_ema_trend') == 'bullish' 
     perf_summary = get_recent_performance_summary()
     risk_budget = balance * MAX_RISK_PERCENT / 100
 
-    prompt = f"""You are **AlphaEdge**, an elite quantitative futures scalper.
-You trade fast on the 15-minute chart with 1h for context and 4h for macro direction. You look for momentum, order flow, and short-term dislocations. You are aggressive but disciplined.
+    prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader.
+You trade from the 1-hour chart with 15m for entry timing and 4h for macro direction. You look for clean momentum setups with good risk/reward.
 
 ═══ MACRO CONTEXT ═══
 {market_str if market_str else "Market data unavailable."}
@@ -1115,65 +1114,62 @@ Position sizing is automatic — tighter SL = bigger position, wider SL = smalle
 ═══ TOP {len(candidates)} CANDIDATES ═══
 {data_str}
 
-═══ SCALPING FIRST-PRINCIPLES ANALYSIS ═══
-Think through each layer quickly:
+═══ FIRST-PRINCIPLES ANALYSIS ═══
 
 **1. MACRO REGIME (4h)**
-- 4h trend sets the bias. Trade WITH the 4h trend, not against it.
-- Strong 4h bullish = prefer longs. Strong 4h bearish = prefer shorts. Mixed = trade both directions on shorter TF setups.
+- 4h trend sets the directional bias. Trade with it, not against it.
+- Strong 4h bullish = prefer longs. Strong 4h bearish = prefer shorts.
+- 4h mixed/choppy = still trade, just use the 1h chart to find direction.
 
-**2. 1H MOMENTUM & STRUCTURE**
-- 1h EMA trend should support or at least not conflict with the trade.
-- 1h RSI extremes (>70 or <30) can signal mean-reversion scalps.
-- 1h momentum and streak give the medium-term context.
+**2. 1H TREND & STRUCTURE (primary)**
+- This is your main timeframe. Base the trade on 1h EMA trend, RSI, momentum, and price structure.
+- Look for: clear 1h EMA alignment, momentum building in one direction, RSI not at extremes against you.
+- Bollinger position matters: price at lower band in uptrend = buy the dip. Price at upper band in downtrend = short the rip.
+- VWAP: trading above VWAP in a long = healthy. Below VWAP in a long = weaker.
+- 1h S/R range gives you your stop loss and take profit levels.
 
-**3. 15M ENTRY SIGNAL (primary)**
-- This is where you enter. Look for:
-  - 15m EMA crossovers or price reclaiming EMAs
-  - 15m RSI bouncing off oversold (longs) or overbought (shorts)
-  - 15m momentum shifting in your favor
-  - 15m Bollinger squeeze breakouts or band touches for reversals
-  - VWAP reclaims or rejections
-- A clean 15m signal WITH 1h/4h alignment = high confidence trade.
-- A clean 15m signal AGAINST higher TF = lower confidence, tighter SL.
+**3. 15M ENTRY TIMING**
+- Use 15m to refine entry. A 1h setup with a 15m pullback = ideal entry point.
+- 15m EMA crossover in the direction of 1h trend = confirmation.
+- 15m momentum shifting back in favor after a dip = good timing signal.
+- Don't need 15m to be perfect — it's just timing, not the thesis.
 
 **4. ORDER FLOW & VOLUME**
-- Buy-heavy book imbalance + bullish 15m signal = strong long.
-- Sell-heavy book imbalance + bearish 15m signal = strong short.
-- Volume ratio >1.5 on 15m adds conviction.
-- Low volume = smaller position or skip.
+- Buy-heavy book + bullish 1h = stronger conviction for longs.
+- Sell-heavy book + bearish 1h = stronger conviction for shorts.
+- Volume ratio >1.5 on 1h adds conviction. Low volume = lighter leverage.
 
 **5. FUNDING & POSITIONING**
 - Extreme negative funding = crowded shorts, squeeze longs have extra edge.
 - Extreme positive funding = crowded longs, adds edge to shorts.
-- Use as a tiebreaker or confidence booster, not the main thesis.
+- L/S ratio heavily skewed = contrarian edge. Use as confidence booster.
 
 **6. STOP LOSS PLACEMENT**
-- SL at the 15m level that invalidates your entry: below the 15m swing low (longs) or above the 15m swing high (shorts).
-- Use recent S/R from the 15m range.
-- Tight stops: 0.5-3% from entry. Scalping means small stops, not wide ones.
+- SL at the 1h level that invalidates your thesis.
+- For longs: below 1h recent support / swing low / lower Bollinger band.
+- For shorts: above 1h recent resistance / swing high / upper Bollinger band.
+- Typically 1-5% from entry depending on the coin's ATR.
 
 **7. TAKE PROFIT PLACEMENT**
-- Next 15m/1h resistance (longs) or support (shorts).
-- Minimum 2:1 R:R — this is NON-NEGOTIABLE.
-- With tight stops, TP can be modest in absolute terms but still good R:R.
+- Next meaningful 1h resistance (longs) or support (shorts).
+- Minimum 2:1 R:R — NON-NEGOTIABLE.
 
 **8. WHEN TO HOLD**
-- HOLD when 15m has no clear momentum or direction.
-- HOLD when all timeframes conflict with no clean signal.
-- But you're checked every {INTERVAL_MINUTES} minutes — if there's a reasonable setup, take it. Don't wait for perfection.
+- HOLD when the 1h chart has no clear direction or momentum.
+- HOLD when the best setup is marginal and you'd be forcing it.
+- But don't be too picky — you're checked every {INTERVAL_MINUTES} minutes. If there's a decent setup, take it.
 
 ═══ RULES ═══
 - CRITICAL: "symbol" must be EXACTLY one of the symbols listed above.
 - For LONG: stop_loss BELOW entry, take_profit ABOVE entry.
 - For SHORT: stop_loss ABOVE entry, take_profit BELOW entry.
-- SL at a technical invalidation level (0.5-3% from entry).
+- SL at a technical invalidation level (1-5% from entry).
 - TP at minimum 2:1 R:R.
-- Leverage 15-20x for clean setups where 15m + 1h + 4h all agree.
-- Leverage 10-15x for solid setups where 2/3 timeframes agree.
-- Leverage 5-10x for weaker setups with one strong signal.
+- Leverage 15-20x when 1h + 4h strongly agree with confirming 15m.
+- Leverage 10-15x for solid 1h setups with 4h support.
+- Leverage 5-10x for decent 1h setups without full alignment.
 - Confidence ≥ 0.55 to trade. Below 0.55 = hold.
-- You should be looking to trade. Find the best available setup.
+- You should be looking to trade when there's an edge. Don't sit on the sidelines unnecessarily.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1254,11 +1250,13 @@ async def grok_evaluate_position(position, candidates, balance):
         if ta15:
             coin_str += f"15m: RSI {ta15['rsi']:.1f} | EMA9 ${ta15['ema9']:,.2f} EMA21 ${ta15['ema21']:,.2f} ({ta15['ema_trend']}) | "
             coin_str += f"Mom: {ta15['momentum_5']:+.2f}% | Streak: {ta15['candle_streak']:+d} | "
-            coin_str += f"BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']} | "
-            coin_str += f"S/R: ${ta15['recent_low']:,.2f}-${ta15['recent_high']:,.2f}\n"
+            coin_str += f"BB {ta15['bb_position']} | VWAP {ta15['price_vs_vwap']}\n"
         if ta1h:
             coin_str += f"1h:  RSI {ta1h['rsi']:.1f} | EMA9 ${ta1h['ema9']:,.2f} EMA21 ${ta1h['ema21']:,.2f} ({ta1h['ema_trend']}) | "
-            coin_str += f"Mom: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d}\n"
+            coin_str += f"ATR {ta1h['atr_pct']:.2f}% | Vol×{ta1h['vol_ratio']:.1f} | "
+            coin_str += f"BB {ta1h['bb_position']} | VWAP {ta1h['price_vs_vwap']} | "
+            coin_str += f"Mom: {ta1h['momentum_5']:+.2f}% | Streak: {ta1h['candle_streak']:+d} | "
+            coin_str += f"S/R: ${ta1h['recent_low']:,.2f}-${ta1h['recent_high']:,.2f}\n"
         if ta4h:
             coin_str += f"4h:  RSI {ta4h['rsi']:.1f} | EMA9 ${ta4h['ema9']:,.2f} EMA21 ${ta4h['ema21']:,.2f} ({ta4h['ema_trend']}) | "
             coin_str += f"Mom: {ta4h['momentum_5']:+.2f}% | Streak: {ta4h['candle_streak']:+d}\n"
@@ -1270,8 +1268,8 @@ async def grok_evaluate_position(position, candidates, balance):
     if mc:
         market_str = f"BTC: ${mc.get('btc_price', 0):,.0f} | 4h: {mc.get('btc_4h_pct', 0):+.2f}% | 24h: {mc.get('btc_24h_pct', 0):+.2f}% | RSI: {mc.get('btc_rsi', 50):.0f} | Trend: {mc.get('btc_ema_trend', 'mixed')}"
 
-    prompt = f"""You are **AlphaEdge**, an elite quantitative futures scalper managing an open position.
-You trade on the 15-minute chart. Positions are meant to be short-lived — take profits quickly and cut losses fast.
+    prompt = f"""You are **AlphaEdge**, an elite quantitative futures trader managing an open position.
+You trade from the 1-hour chart. Positions should run while the 1h thesis holds, but don't overstay.
 
 ═══ MACRO ═══
 {market_str if market_str else "Unavailable"}
@@ -1284,38 +1282,37 @@ Notional: ${position['notional']:,.0f} | Contracts: {position['contracts']}
 ═══ CURRENT MARKET DATA FOR {symbol} ═══
 {coin_str if coin_str else "Data unavailable — close if uncertain."}
 
-═══ SCALP POSITION MANAGEMENT ═══
-Think through each layer quickly — you're checked every {INTERVAL_MINUTES} minutes:
+═══ POSITION MANAGEMENT ═══
+You're re-evaluated every {INTERVAL_MINUTES} minutes.
 
-**1. 15M MOMENTUM (primary)**
-- Is 15m momentum still moving in your direction?
-- Has 15m EMA trend flipped against you?
-- 15m RSI hitting extremes against your position (>75 for longs, <25 for shorts) = take profit or close.
-- 15m candle streak reversing = momentum shifting.
+**1. 1H TREND & MOMENTUM (primary)**
+- Is the 1h EMA trend still supporting your position? This is the key question.
+- 1h momentum still in your favor = usually keep.
+- 1h EMA trend flipping against you = strong reason to close.
+- Price breaking below 1h support (longs) or above 1h resistance (shorts) = thesis weakening.
+- 1h RSI at extremes against you (>75 for longs, <25 for shorts) = consider taking profit.
 
-**2. 1H CONTEXT**
-- Is the 1h still supportive? If 1h momentum has flipped against you, the scalp is fighting the tide.
-- 1h EMA trend change = strong close signal.
+**2. 15M CONFIRMATION**
+- 15m momentum can show early signs of a 1h reversal.
+- 15m flipping against you while 1h is still OK = not enough to close by itself.
+- 15m AND 1h both turning against you = close.
 
-**3. PROFIT TAKING**
-- Scalps should be closed with profit when momentum fades — don't hold for home runs.
-- Good profit (>1.5% leveraged) with fading 15m momentum = close and take it.
-- Great profit (>3% leveraged) = seriously consider closing regardless.
-- The goal is many small wins, not one big win.
+**3. 4H MACRO**
+- If you're long and 4h has turned clearly bearish, the wind is against you — raises urgency to close.
+- 4h still neutral or supportive = no reason to close from macro alone.
 
-**4. LOSS MANAGEMENT**
-- Small loss with intact 15m momentum = keep, the setup may still work.
-- Loss >-2% leveraged with 15m momentum against you = close, the setup failed.
-- Loss >-4% leveraged = close regardless. The scalp thesis is dead.
+**4. PROFIT & LOSS**
+- Good profit (>2-3% leveraged) with 1h momentum fading = take the win.
+- Large profit (>5% leveraged) = seriously consider closing, especially if momentum is slowing.
+- Moderate loss with 1h thesis intact = keep. Losses alone don't close a trade.
+- Large loss (>5-8% leveraged) with 1h thesis broken = close and move on.
+- Small loss or breakeven = focus on whether the 1h setup still makes sense.
 
-**5. ORDER FLOW**
-- Book imbalance flipped against your position = weakening signal.
-- This alone doesn't close, but combined with fading momentum = close.
-
-**6. OVERALL**
-- Scalps are meant to be fast. If the momentum that got you in is gone, get out.
-- Don't hold a scalp hoping it turns into a swing trade.
-- When in doubt on a scalp, close. You'll get another setup in {INTERVAL_MINUTES} minutes.
+**5. OVERALL**
+- Default is KEEP if the 1h thesis is intact. Don't close on noise.
+- CLOSE when your 1h reason for entering has changed.
+- Don't be afraid to take profits — there will always be another trade.
+- When genuinely uncertain, lean towards closing. Capital preservation matters.
 
 ═══ RESPOND WITH ONLY VALID JSON ═══
 {{
@@ -1724,7 +1721,7 @@ async def main_loop():
     print(f"🐢 Rate limits: public {PUBLIC_RATE_LIMIT_MS}ms | trading {TRADING_RATE_LIMIT_MS}ms | gap {API_SLEEP_SECONDS:.2f}s", flush=True)
     print(f"📐 Risk-based sizing: position = risk_budget / SL_distance", flush=True)
     print(f"📌 Strict single position — new signals ignored while position is open", flush=True)
-    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, 15min scalping", flush=True)
+    print(f"🔬 Enhanced: RSI, EMA, ATR, Bollinger, VWAP, order book, 1h primary + 15m/4h context", flush=True)
     print("=" * 60, flush=True)
 
     # Balance fetch with retry
