@@ -32,9 +32,9 @@ MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
 MAX_MARGIN_PERCENT = float(os.getenv("MAX_MARGIN_PERCENT", "50"))  # Max % of balance used as margin
 PUBLIC_RATE_LIMIT_MS = int(os.getenv("PUBLIC_RATE_LIMIT_MS", "1200"))
 TRADING_RATE_LIMIT_MS = int(os.getenv("TRADING_RATE_LIMIT_MS", "1500"))
-ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "5"))
-TOP5_FULL_ENRICH = int(os.getenv("TOP5_FULL_ENRICH", "3"))
-API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "1.0"))
+ENRICH_TOP_N = int(os.getenv("ENRICH_TOP_N", "3"))
+TOP5_FULL_ENRICH = int(os.getenv("TOP5_FULL_ENRICH", "2"))
+API_SLEEP_SECONDS = float(os.getenv("API_SLEEP_SECONDS", "1.5"))
 
 print("=== HIGH LEVERAGE TOP20 SCANNER STARTING ===", flush=True)
 print(f"{XAI_MODEL} | reasoning effort: {XAI_REASONING_EFFORT} + Risk-Based Sizing + Cross Margin", flush=True)
@@ -929,6 +929,27 @@ async def deep_enrich(candidates, top_n=5):
             market_context['eth_price'] = eth_now
             market_context['eth_24h_pct'] = (eth_now - eth_24h_ago) / eth_24h_ago * 100 if eth_24h_ago else 0
         await asyncio.sleep(API_SLEEP_SECONDS)
+    except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
+        if 'banned' in str(e).lower():
+            print(f"   🚫 IP banned fetching market context — skipping enrichment, waiting 120s", flush=True)
+            await asyncio.sleep(120)
+            # Return candidates with empty enrichment
+            for c in candidates[:top_n]:
+                c['funding'] = 0.0
+                c['ta_15m'] = None
+                c['ta_1h'] = None
+                c['ta_4h'] = None
+                c['open_interest'] = 0
+                c['oi_notional'] = 0
+                c['long_short_ratio'] = 1.0
+                c['long_pct'] = 50
+                c['short_pct'] = 50
+                c['ls_trend'] = 'n/a'
+                c['order_book'] = None
+                c['market_context'] = market_context
+            return candidates[:top_n]
+        print(f"   ⚠️ Market context rate limited — continuing with partial data: {e}", flush=True)
+        await asyncio.sleep(30)
     except Exception as e:
         print(f"   ⚠️ Market context fetch error: {e}", flush=True)
 
@@ -1015,19 +1036,51 @@ async def deep_enrich(candidates, top_n=5):
                 c['order_book'] = None
 
         except (ccxt.DDoSProtection, ccxt.ExchangeNotAvailable) as e:
-            print(f"   ⚠️ Rate limited during enrichment — pausing 30s: {e}", flush=True)
-            await asyncio.sleep(30)
-            c['funding'] = c.get('funding', 0.0)
-            c['ta_15m'] = None
-            c['ta_1h'] = None
-            c['ta_4h'] = c.get('ta_4h')
-            c['open_interest'] = 0
-            c['oi_notional'] = 0
-            c['long_short_ratio'] = 1.0
-            c['long_pct'] = 50
-            c['short_pct'] = 50
-            c['ls_trend'] = 'n/a'
-            c['order_book'] = None
+            err_msg = str(e)
+            if 'banned' in err_msg.lower():
+                # IP ban — no point continuing enrichment, wait and use what we have
+                print(f"   🚫 IP banned during enrichment — using partial data", flush=True)
+                c['funding'] = c.get('funding', 0.0)
+                c['ta_15m'] = c.get('ta_15m')
+                c['ta_1h'] = c.get('ta_1h')
+                c['ta_4h'] = c.get('ta_4h')
+                c['open_interest'] = 0
+                c['oi_notional'] = 0
+                c['long_short_ratio'] = 1.0
+                c['long_pct'] = 50
+                c['short_pct'] = 50
+                c['ls_trend'] = 'n/a'
+                c['order_book'] = None
+                enriched.append(c)
+                # Skip remaining coins — we're banned
+                for remaining in candidates[i+1:top_n]:
+                    remaining['funding'] = 0.0
+                    remaining['ta_15m'] = None
+                    remaining['ta_1h'] = None
+                    remaining['ta_4h'] = None
+                    remaining['open_interest'] = 0
+                    remaining['oi_notional'] = 0
+                    remaining['long_short_ratio'] = 1.0
+                    remaining['long_pct'] = 50
+                    remaining['short_pct'] = 50
+                    remaining['ls_trend'] = 'n/a'
+                    remaining['order_book'] = None
+                    enriched.append(remaining)
+                break
+            else:
+                print(f"   ⚠️ Rate limited during enrichment — pausing 60s: {e}", flush=True)
+                await asyncio.sleep(60)
+                c['funding'] = c.get('funding', 0.0)
+                c['ta_15m'] = c.get('ta_15m')
+                c['ta_1h'] = c.get('ta_1h')
+                c['ta_4h'] = c.get('ta_4h')
+                c['open_interest'] = 0
+                c['oi_notional'] = 0
+                c['long_short_ratio'] = 1.0
+                c['long_pct'] = 50
+                c['short_pct'] = 50
+                c['ls_trend'] = 'n/a'
+                c['order_book'] = None
         except Exception as e:
             print(f"   ⚠️ Enrich error on {symbol}: {e}", flush=True)
             c['funding'] = c.get('funding', 0.0)
